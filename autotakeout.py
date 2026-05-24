@@ -2473,7 +2473,7 @@ def main() -> None:
     backrest.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
     backrest.add_argument("--b2-key-id")
     backrest.add_argument("--b2-key")
-    backrest.add_argument("--bind-address", default="127.0.0.1:9899", help="Backrest bind address")
+    backrest.add_argument("--bind-address", default="127.0.0.1:9898", help="Backrest bind address")
     backrest.add_argument("--backrest-config", type=Path, help="Backrest config path")
     backrest.add_argument("--backrest-data", type=Path, help="Backrest data directory")
 
