@@ -202,6 +202,32 @@ def main() -> None:
     ex.add_argument("--raw", type=Path)
     ex.add_argument("--merged", type=Path)
 
+    backup = sub.add_parser("backup", help="Back up existing raw and merged outputs with restic")
+    backup.add_argument("--raw", type=Path)
+    backup.add_argument("--merged", type=Path)
+    backup.add_argument("--skip-merged", action="store_true", help="Back up only raw archives")
+    backup.add_argument("--restic-repo")
+    backup.add_argument("--restic-password-file", type=Path)
+    backup.add_argument("--b2-bucket", help="Backblaze B2 bucket to create/use for restic")
+    backup.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
+    backup.add_argument("--b2-key-id")
+    backup.add_argument("--b2-key")
+    backup.add_argument(
+        "--verify-restic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Verify restic after backup; use --no-verify-restic to skip.",
+    )
+    backup.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
+    backup.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
+    backup.add_argument("--restic-sample-count", type=int, default=5, help="Number of files to restore and hash-check")
+    backup.add_argument(
+        "--restic-sample-max-mib",
+        type=int,
+        default=512,
+        help="Maximum sample file size in MiB; 0 disables the limit",
+    )
+
     restic = sub.add_parser("restic", help="Run restic backup")
     restic.add_argument("paths", nargs="+", type=Path)
     restic.add_argument("--repo", default=os.environ.get("RESTIC_REPOSITORY"))
@@ -272,23 +298,11 @@ def main() -> None:
         else:
             download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
         if a.restic:
-            paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
-            marker = write_restic_restore_marker(a.raw)
-            manifest = write_restic_validation_manifest(
-                a.raw,
-                paths,
-                sample_count=a.restic_sample_count,
-                sample_max_mib=a.restic_sample_max_mib,
-            )
-            run_restic_backup(restic_plan, paths)
-            if a.verify_restic:
-                verify_restic_backup(
-                    restic_plan,
-                    marker_path=marker,
-                    manifest_path=manifest,
-                    subset=a.restic_check_subset,
-                    full=a.restic_full_check,
-                )
+            run_backup_flow(a, restic_plan, paths=[a.raw] if a.skip_extract else [a.raw, a.merged])
+    elif a.cmd == "backup":
+        resolve_preferences(a, raw=True, merged=not a.skip_merged, restic=True)
+        paths = [a.raw] if a.skip_merged else [a.raw, a.merged]
+        run_backup_flow(a, setup_restic(a), paths=paths)
     elif a.cmd == "restic":
         if not a.repo:
             raise SystemExit("--repo or RESTIC_REPOSITORY is required")
@@ -605,24 +619,7 @@ def guided(a: argparse.Namespace) -> None:
 
     if a.restic:
         print("6. Running restic backup.")
-        paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
-        marker = write_restic_restore_marker(a.raw)
-        manifest = write_restic_validation_manifest(
-            a.raw,
-            paths,
-            sample_count=a.restic_sample_count,
-            sample_max_mib=a.restic_sample_max_mib,
-        )
-        run_restic_backup(restic_plan, paths)
-        if a.verify_restic:
-            print("7. Verifying restic backup.")
-            verify_restic_backup(
-                restic_plan,
-                marker_path=marker,
-                manifest_path=manifest,
-                subset=a.restic_check_subset,
-                full=a.restic_full_check,
-            )
+        run_backup_flow(a, restic_plan, paths=[a.raw] if a.skip_extract else [a.raw, a.merged])
 
     if a.rclone_remote:
         print("6. Running rclone backup.")
@@ -635,6 +632,31 @@ def guided(a: argparse.Namespace) -> None:
                 "--progress",
             ],
             check=True,
+        )
+
+
+def run_backup_flow(a: argparse.Namespace, restic_plan: dict, *, paths: list[Path]) -> None:
+    existing = [path for path in paths if path.exists()]
+    missing = [path for path in paths if not path.exists()]
+    if missing:
+        raise SystemExit("Backup path does not exist: " + ", ".join(str(path) for path in missing))
+
+    marker = write_restic_restore_marker(a.raw)
+    manifest = write_restic_validation_manifest(
+        a.raw,
+        existing,
+        sample_count=a.restic_sample_count,
+        sample_max_mib=a.restic_sample_max_mib,
+    )
+    run_restic_backup(restic_plan, existing)
+    if a.verify_restic:
+        print("Verifying restic backup.")
+        verify_restic_backup(
+            restic_plan,
+            marker_path=marker,
+            manifest_path=manifest,
+            subset=a.restic_check_subset,
+            full=a.restic_full_check,
         )
 
 

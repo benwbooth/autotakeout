@@ -52,6 +52,12 @@ To verify an existing configured restic backup without touching Gmail or Takeout
 ./autotakeout.py verify
 ```
 
+To back up and verify already-downloaded/already-extracted files without touching Gmail or Takeout:
+
+```sh
+./autotakeout.py backup --b2-bucket globally-unique-bucket-name
+```
+
 Debug escape hatches:
 
 ```sh
