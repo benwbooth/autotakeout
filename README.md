@@ -40,7 +40,13 @@ To create or use a Backblaze B2 bucket and initialize restic automatically:
 
 For B2 credentials, set either `B2_ACCOUNT_ID`/`B2_ACCOUNT_KEY` or `B2_APPLICATION_KEY_ID`/`B2_APPLICATION_KEY`. If they are not set, the script prompts for them. It creates `~/.local/state/autotakeout/restic-password` if no `RESTIC_PASSWORD_FILE` is set.
 
-Restic is part of the normal flow. Use `--no-restic` only when you explicitly want to skip backup.
+Restic is part of the normal flow. Use `--no-restic` only when you explicitly want to skip backup. After backup, the script verifies restic by restoring a small marker file from the latest snapshot and running `restic check --read-data-subset 1%`. Use `--restic-full-check` to run `restic check --read-data` instead.
+
+To verify an existing configured restic backup without touching Gmail or Takeout:
+
+```sh
+./autotakeout.py verify
+```
 
 Debug escape hatches:
 

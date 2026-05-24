@@ -12,7 +12,8 @@
 # Examples:
 #   ./autotakeout.py
 #   ./autotakeout.py --poll 300 --timeout 0
-#   ./autotakeout.py --restic --b2-bucket my-unique-bucket-name
+#   ./autotakeout.py --b2-bucket my-unique-bucket-name
+#   ./autotakeout.py verify
 #   ./autotakeout.py --google-password 'your-google-password'
 #
 # Debug escape hatches:
@@ -62,6 +63,7 @@ STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autotakeout" / "config.json"
 BROWSER_DOWNLOAD_RETRIES = 5
 RAW_EXPORT_MARKER = ".autotakeout-export.json"
+RESTIC_RESTORE_MARKER = ".autotakeout-restore-marker.json"
 
 
 def main() -> None:
@@ -100,6 +102,14 @@ def main() -> None:
     p.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
     p.add_argument("--b2-key-id")
     p.add_argument("--b2-key")
+    p.add_argument(
+        "--verify-restic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Verify restic after backup; use --no-verify-restic to skip.",
+    )
+    p.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
+    p.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
     p.add_argument("--rclone-remote", help="Run rclone copy after extraction, e.g. b2remote:google-photos")
     p.add_argument("--rclone-sync", action="store_true")
     p.add_argument("--force-login", action="store_true", help="Always open the browser login step first")
@@ -137,6 +147,14 @@ def main() -> None:
     run.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
     run.add_argument("--b2-key-id")
     run.add_argument("--b2-key")
+    run.add_argument(
+        "--verify-restic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Verify restic after backup; use --no-verify-restic to skip.",
+    )
+    run.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
+    run.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
 
     links = sub.add_parser("links", help="Print and cache links from the newest Takeout email")
     links.add_argument("--credentials", type=Path)
@@ -160,6 +178,17 @@ def main() -> None:
     restic = sub.add_parser("restic", help="Run restic backup")
     restic.add_argument("paths", nargs="+", type=Path)
     restic.add_argument("--repo", default=os.environ.get("RESTIC_REPOSITORY"))
+
+    verify = sub.add_parser("verify", help="Verify the restic backup")
+    verify.add_argument("--raw", type=Path)
+    verify.add_argument("--restic-repo")
+    verify.add_argument("--restic-password-file", type=Path)
+    verify.add_argument("--b2-bucket", help="Backblaze B2 bucket used for restic")
+    verify.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
+    verify.add_argument("--b2-key-id")
+    verify.add_argument("--b2-key")
+    verify.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
+    verify.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
 
     rclone = sub.add_parser("rclone", help="Run rclone copy/sync")
     rclone.add_argument("source", type=Path)
@@ -207,11 +236,27 @@ def main() -> None:
             extract_all(a.raw, a.merged)
         if a.restic:
             paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
+            marker = write_restic_restore_marker(a.raw)
             run_restic_backup(restic_plan, paths)
+            if a.verify_restic:
+                verify_restic_backup(
+                    restic_plan,
+                    marker_path=marker,
+                    subset=a.restic_check_subset,
+                    full=a.restic_full_check,
+                )
     elif a.cmd == "restic":
         if not a.repo:
             raise SystemExit("--repo or RESTIC_REPOSITORY is required")
         subprocess.run(["restic", "-r", a.repo, "backup", *map(str, a.paths)], check=True)
+    elif a.cmd == "verify":
+        resolve_preferences(a, raw=True, restic=True)
+        verify_restic_backup(
+            setup_restic(a, initialize=False),
+            marker_path=a.raw / RESTIC_RESTORE_MARKER,
+            subset=a.restic_check_subset,
+            full=a.restic_full_check,
+        )
     elif a.cmd == "rclone":
         subprocess.run(["rclone", "sync" if a.sync else "copy", str(a.source), a.remote, "--progress"], check=True)
 
@@ -281,7 +326,7 @@ def resolve_preferences(
         if explicit_bucket is None:
             a.b2_bucket = config.get("b2_bucket")
         if getattr(a, "b2_prefix", None) is None:
-            a.b2_prefix = config.get("b2_prefix", "autotakeout-restic")
+            a.b2_prefix = config.get("b2_prefix") or "autotakeout-restic"
         config["b2_prefix"] = a.b2_prefix
         changed = True
 
@@ -464,7 +509,16 @@ def guided(a: argparse.Namespace) -> None:
     if a.restic:
         print("6. Running restic backup.")
         paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
+        marker = write_restic_restore_marker(a.raw)
         run_restic_backup(restic_plan, paths)
+        if a.verify_restic:
+            print("7. Verifying restic backup.")
+            verify_restic_backup(
+                restic_plan,
+                marker_path=marker,
+                subset=a.restic_check_subset,
+                full=a.restic_full_check,
+            )
 
     if a.rclone_remote:
         print("6. Running rclone backup.")
@@ -480,7 +534,7 @@ def guided(a: argparse.Namespace) -> None:
         )
 
 
-def setup_restic(a: argparse.Namespace) -> dict:
+def setup_restic(a: argparse.Namespace, *, initialize: bool = True) -> dict:
     repo = a.restic_repo
     bucket = bucket_from_restic_repo(repo) or a.b2_bucket
     if not repo:
@@ -490,15 +544,16 @@ def setup_restic(a: argparse.Namespace) -> dict:
             raise SystemExit("--b2-bucket is required when --restic-repo is not set")
         repo = f"b2:{bucket}:{a.b2_prefix}"
 
-    password_file = ensure_restic_password_file(a.restic_password_file)
+    password_file = ensure_restic_password_file(a.restic_password_file, create=initialize)
     env = os.environ.copy()
 
     if repo.startswith("b2:"):
         env = b2_env(a)
         bucket = bucket_from_restic_repo(repo)
-    if bucket and repo.startswith("b2:"):
+    if initialize and bucket and repo.startswith("b2:"):
         ensure_b2_bucket(bucket, env)
-    ensure_restic_repo(repo, password_file, env)
+    if initialize:
+        ensure_restic_repo(repo, password_file, env)
 
     config = load_config()
     config["restic_repo"] = repo
@@ -533,10 +588,12 @@ def b2_env(a: argparse.Namespace) -> dict:
     return env
 
 
-def ensure_restic_password_file(path: Path | None) -> Path:
+def ensure_restic_password_file(path: Path | None, *, create: bool = True) -> Path:
     path = path or (STATE / "restic-password")
     if path.exists():
         return path
+    if not create:
+        raise SystemExit(f"Restic password file does not exist: {path}")
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(secrets.token_urlsafe(48) + "\n")
@@ -595,7 +652,7 @@ def authorize_b2(env: dict, b2: str) -> None:
 
 def ensure_restic_repo(repo: str, password_file: Path, env: dict) -> None:
     probe = subprocess.run(
-        ["restic", "-r", repo, "--password-file", str(password_file), "snapshots", "--json"],
+        restic_base_command({"repo": repo, "password_file": password_file}) + ["snapshots", "--json"],
         env=env,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.PIPE,
@@ -607,7 +664,7 @@ def ensure_restic_repo(repo: str, password_file: Path, env: dict) -> None:
 
     print("Initializing restic repo.")
     subprocess.run(
-        ["restic", "-r", repo, "--password-file", str(password_file), "init"],
+        restic_base_command({"repo": repo, "password_file": password_file}) + ["init"],
         env=env,
         check=True,
     )
@@ -615,12 +672,8 @@ def ensure_restic_repo(repo: str, password_file: Path, env: dict) -> None:
 
 def run_restic_backup(plan: dict, paths: list[Path]) -> None:
     subprocess.run(
-        [
-            "restic",
-            "-r",
-            plan["repo"],
-            "--password-file",
-            str(plan["password_file"]),
+        restic_base_command(plan)
+        + [
             "backup",
             "--tag",
             "autotakeout",
@@ -629,6 +682,75 @@ def run_restic_backup(plan: dict, paths: list[Path]) -> None:
         env=plan["env"],
         check=True,
     )
+
+
+def write_restic_restore_marker(raw: Path) -> Path:
+    raw.mkdir(parents=True, exist_ok=True)
+    marker = raw / RESTIC_RESTORE_MARKER
+    marker.write_text(
+        json.dumps(
+            {
+                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "purpose": "autotakeout restic restore verification",
+                "raw": str(raw),
+                "token": secrets.token_urlsafe(24),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n"
+    )
+    marker.chmod(0o600)
+    return marker
+
+
+def verify_restic_backup(
+    plan: dict,
+    *,
+    marker_path: Path | None = None,
+    subset: str | None = "1%",
+    full: bool = False,
+) -> None:
+    if marker_path and marker_path.exists():
+        verify_restic_marker(plan, marker_path)
+    else:
+        print("No restore marker found; skipping marker dump verification.")
+
+    command = restic_base_command(plan) + ["check"]
+    if full:
+        command.append("--read-data")
+    elif subset:
+        command.extend(["--read-data-subset", subset])
+    print("Running " + " ".join(command[:1] + command[5:]))
+    subprocess.run(command, env=plan["env"], check=True)
+    print("restic verification completed")
+
+
+def verify_restic_marker(plan: dict, marker_path: Path) -> None:
+    expected = marker_path.read_bytes()
+    marker = marker_path.resolve()
+    command = restic_base_command(plan) + [
+        "dump",
+        "--tag",
+        "autotakeout",
+        "--path",
+        str(marker.parent),
+        "latest",
+        str(marker),
+    ]
+    restored = subprocess.run(
+        command,
+        env=plan["env"],
+        check=True,
+        stdout=subprocess.PIPE,
+    ).stdout
+    if restored != expected:
+        raise RuntimeError(f"Restic restore marker mismatch for {marker}")
+    print(f"restic marker restore verified: {marker}")
+
+
+def restic_base_command(plan: dict) -> list[str]:
+    return ["restic", "-r", plan["repo"], "--password-file", str(plan["password_file"])]
 
 
 def gmail_service(credentials: Path, token: Path):
