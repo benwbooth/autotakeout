@@ -1,0 +1,25 @@
+__pycache__/
+*.py[cod]
+.venv/
+
+# Local OAuth/client secrets and tokens.
+client_secret*.json
+credentials*.json
+google_oauth*.json
+oauth*.json
+gmail-token.json
+token.json
+
+# Downloaded exports and local state.
+data/
+*.tgz
+*.tar.gz
+*.crdownload
+*.aria2
+cookies.txt
+links.json
+restic-password
+
+# Local environment files.
+.env
+.env.*
