@@ -31,6 +31,8 @@ It checks Gmail auth, checks browser login, opens Takeout if an export is not re
 
 If Google says `This browser or app may not be secure`, the script was using an automation-controlled browser. Current versions launch normal Brave/Chrome directly for login. Rerun `./autotakeout.py --force-login`; if the dedicated profile is wedged, remove `~/.local/state/autotakeout/browser-profile` and rerun.
 
+If Google asks for your password again before archive downloads, the script prompts for it in the terminal only when needed and never stores it. You can also pass it once with `--google-password`.
+
 To create or use a Backblaze B2 bucket and initialize restic automatically:
 
 ```sh

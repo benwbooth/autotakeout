@@ -1975,6 +1975,7 @@ def wait_for_browser_download(
     last_progress_width = 0
     waiting_for_auth = False
     password_submitted = False
+    password_prompted = False
     while True:
         try:
             event = cdp_next_event(ws)
@@ -1989,6 +1990,14 @@ def wait_for_browser_download(
                     password_submitted = True
                     waiting_for_auth = True
                     continue
+                if not google_password and not password_prompted and google_password_prompt_visible(ws):
+                    password_prompted = True
+                    google_password = getpass.getpass("Google password for Takeout reauth (not stored): ")
+                    if google_password and submit_google_password(ws, google_password):
+                        print("Submitted Google password challenge.")
+                        password_submitted = True
+                        waiting_for_auth = True
+                        continue
                 if not waiting_for_auth:
                     print("Google is asking for interactive verification before downloading.")
                     print("Finish the Google verification in the browser; the script will continue automatically.")
@@ -2096,6 +2105,19 @@ def browser_page_summary(ws) -> dict:
         timeout=5,
     )
     return detail if isinstance(detail, dict) else {"detail": detail}
+
+
+def google_password_prompt_visible(ws) -> bool:
+    expression = """
+(() => {
+  const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
+  return Array.from(document.querySelectorAll('input[type="password"]')).some(visible);
+})()
+"""
+    try:
+        return bool(cdp_eval(ws, expression, timeout=5))
+    except Exception:
+        return False
 
 
 def submit_google_password(ws, password: str) -> bool:
