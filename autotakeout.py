@@ -62,11 +62,19 @@ URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "autotakeout"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autotakeout" / "config.json"
 SECRETS = STATE / "secrets.json"
+PENDING_EXPORT = STATE / "pending-export.json"
 BROWSER_DOWNLOAD_RETRIES = 5
+PENDING_EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 RAW_EXPORT_MARKER = ".autotakeout-export.json"
+RAW_DOWNLOADS_MARKER = ".autotakeout-downloads.json"
 RESTIC_RESTORE_MARKER = ".autotakeout-restore-marker.json"
 RESTIC_VALIDATION_MANIFEST = ".autotakeout-validation.json"
-VALIDATION_METADATA_NAMES = {RAW_EXPORT_MARKER, RESTIC_RESTORE_MARKER, RESTIC_VALIDATION_MANIFEST}
+VALIDATION_METADATA_NAMES = {
+    RAW_EXPORT_MARKER,
+    RAW_DOWNLOADS_MARKER,
+    RESTIC_RESTORE_MARKER,
+    RESTIC_VALIDATION_MANIFEST,
+}
 
 
 def main() -> None:
@@ -224,12 +232,12 @@ def main() -> None:
             gmail_service(a.credentials, STATE / "gmail-token.json")
         browser_login(a.profile, a.browser)
     elif a.cmd == "links":
-        resolve_preferences(a, credentials=True)
+        resolve_preferences(a, credentials=True, save=False)
         found = find_takeout_links(a.credentials, a.token, a.query, a.max_emails)
         save_links(found)
         print_links(found, show=a.show)
     elif a.cmd == "download":
-        resolve_preferences(a, browser=True, raw=True)
+        resolve_preferences(a, browser=True, raw=True, save=False)
         archive_links = resolve_archive_download_links(
             [{"url": url, "text": "cached"} for url in load_links()],
             a.profile,
@@ -238,7 +246,7 @@ def main() -> None:
         prepare_raw_directory(a.raw, archive_links, force=a.force)
         download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
     elif a.cmd == "extract":
-        resolve_preferences(a, raw=True, merged=True)
+        resolve_preferences(a, raw=True, merged=True, save=False)
         extract_all(a.raw, a.merged)
     elif a.cmd == "run":
         resolve_preferences(a, credentials=True, browser=True, raw=True, merged=True, restic=a.restic)
@@ -274,9 +282,9 @@ def main() -> None:
             raise SystemExit("--repo or RESTIC_REPOSITORY is required")
         subprocess.run(["restic", "-r", a.repo, "backup", *map(str, a.paths)], check=True)
     elif a.cmd == "verify":
-        resolve_preferences(a, raw=True, restic=True)
+        resolve_preferences(a, raw=True, restic=True, save=False)
         verify_restic_backup(
-            setup_restic(a, initialize=False),
+            setup_restic(a, initialize=False, save=False),
             marker_path=a.raw / RESTIC_RESTORE_MARKER,
             manifest_path=a.raw / RESTIC_VALIDATION_MANIFEST,
             subset=a.restic_check_subset,
@@ -294,6 +302,7 @@ def resolve_preferences(
     raw: bool = False,
     merged: bool = False,
     restic: bool = False,
+    save: bool = True,
 ) -> None:
     config = load_config()
     changed = False
@@ -355,7 +364,7 @@ def resolve_preferences(
         config["b2_prefix"] = a.b2_prefix
         changed = True
 
-    if changed:
+    if changed and save:
         save_config(config)
         print(f"preferences: {CONFIG}")
 
@@ -474,6 +483,43 @@ def prompt_path(
         return path
 
 
+def pending_takeout_export_active() -> bool:
+    try:
+        data = json.loads(PENDING_EXPORT.read_text(encoding="utf-8"))
+        requested_at = float(data.get("requested_at_unix") or 0)
+    except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+
+    age = time.time() - requested_at
+    if age <= PENDING_EXPORT_MAX_AGE_SECONDS:
+        return True
+
+    PENDING_EXPORT.unlink(missing_ok=True)
+    return False
+
+
+def write_pending_takeout_export() -> None:
+    PENDING_EXPORT.parent.mkdir(parents=True, exist_ok=True)
+    PENDING_EXPORT.write_text(
+        json.dumps(
+            {
+                "product": "Google Photos",
+                "requested_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+                "requested_at_unix": time.time(),
+            },
+            indent=2,
+            sort_keys=True,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    PENDING_EXPORT.chmod(0o600)
+
+
+def clear_pending_takeout_export() -> None:
+    PENDING_EXPORT.unlink(missing_ok=True)
+
+
 def guided(a: argparse.Namespace) -> None:
     print(f"state: {STATE}")
     print(f"raw archives: {a.raw}")
@@ -501,11 +547,16 @@ def guided(a: argparse.Namespace) -> None:
     if not found:
         print("No ready Takeout email found.")
         if a.create_export:
-            print("Creating a Google Photos Takeout export automatically.")
-            create_takeout_export(profile=a.profile, browser=a.browser)
+            if pending_takeout_export_active():
+                print("Takeout export was already requested; waiting on Gmail instead of creating another one.")
+            else:
+                print("Creating a Google Photos Takeout export automatically.")
+                create_takeout_export(profile=a.profile, browser=a.browser)
+                write_pending_takeout_export()
         else:
             print("Opening Takeout for manual export creation.")
             open_takeout(profile=a.profile, browser=a.browser)
+            write_pending_takeout_export()
         found = wait_for_takeout_links(
             service,
             query=a.query,
@@ -513,6 +564,7 @@ def guided(a: argparse.Namespace) -> None:
             poll_seconds=a.poll,
             timeout_seconds=a.timeout,
         )
+    clear_pending_takeout_export()
     save_links(found)
     print_links(found, show=False)
 
@@ -566,7 +618,7 @@ def guided(a: argparse.Namespace) -> None:
         )
 
 
-def setup_restic(a: argparse.Namespace, *, initialize: bool = True) -> dict:
+def setup_restic(a: argparse.Namespace, *, initialize: bool = True, save: bool = True) -> dict:
     repo = a.restic_repo
     bucket = bucket_from_restic_repo(repo) or a.b2_bucket
     if not repo:
@@ -587,13 +639,14 @@ def setup_restic(a: argparse.Namespace, *, initialize: bool = True) -> dict:
     if initialize:
         ensure_restic_repo(repo, password_file, env)
 
-    config = load_config()
-    config["restic_repo"] = repo
-    config["restic_password_file"] = str(password_file)
-    if bucket:
-        config["b2_bucket"] = bucket
-    config["b2_prefix"] = a.b2_prefix
-    save_config(config)
+    if save:
+        config = load_config()
+        config["restic_repo"] = repo
+        config["restic_password_file"] = str(password_file)
+        if bucket:
+            config["b2_bucket"] = bucket
+        config["b2_prefix"] = a.b2_prefix
+        save_config(config)
 
     print(f"restic repo: {repo}")
     print(f"restic password file: {password_file}")
@@ -645,8 +698,7 @@ def load_secrets() -> dict:
 
 def save_secrets(data: dict) -> None:
     SECRETS.parent.mkdir(parents=True, exist_ok=True)
-    SECRETS.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    SECRETS.chmod(0o600)
+    write_private_json_if_changed(SECRETS, data)
 
 
 def save_backblaze_b2_secrets(key_id: str, key: str) -> None:
@@ -659,6 +711,16 @@ def save_backblaze_b2_secrets(key_id: str, key: str) -> None:
     data["backblaze_b2"] = updated
     save_secrets(data)
     print(f"stored Backblaze B2 credentials: {SECRETS}")
+
+
+def write_private_json_if_changed(path: Path, data: dict) -> None:
+    content = json.dumps(data, indent=2, sort_keys=True) + "\n"
+    if path.exists() and path.read_text(encoding="utf-8") == content:
+        path.chmod(0o600)
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    path.chmod(0o600)
 
 
 def ensure_restic_password_file(path: Path | None, *, create: bool = True) -> Path:
@@ -748,6 +810,8 @@ def run_restic_backup(plan: dict, paths: list[Path]) -> None:
         restic_base_command(plan)
         + [
             "backup",
+            "--skip-if-unchanged",
+            "--ignore-inode",
             "--tag",
             "autotakeout",
             *map(str, paths),
@@ -760,20 +824,14 @@ def run_restic_backup(plan: dict, paths: list[Path]) -> None:
 def write_restic_restore_marker(raw: Path) -> Path:
     raw.mkdir(parents=True, exist_ok=True)
     marker = raw / RESTIC_RESTORE_MARKER
-    marker.write_text(
-        json.dumps(
-            {
-                "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-                "purpose": "autotakeout restic restore verification",
-                "raw": str(raw),
-                "token": secrets.token_urlsafe(24),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
+    write_private_json_if_changed(
+        marker,
+        {
+            "purpose": "autotakeout restic restore verification",
+            "raw": str(raw),
+            "version": 1,
+        },
     )
-    marker.chmod(0o600)
     return marker
 
 
@@ -787,7 +845,6 @@ def write_restic_validation_manifest(
     roots = [path.resolve() for path in paths]
     sample_max_bytes = None if sample_max_mib <= 0 else sample_max_mib * 1024**2
     manifest = {
-        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
         "version": 1,
         "paths": [summarize_local_root(root) for root in roots],
         "sample_max_bytes": sample_max_bytes,
@@ -795,8 +852,7 @@ def write_restic_validation_manifest(
     }
 
     path = raw / RESTIC_VALIDATION_MANIFEST
-    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
-    path.chmod(0o600)
+    write_private_json_if_changed(path, manifest)
     print(
         "validation manifest: "
         f"{sum(item['file_count'] for item in manifest['paths'])} files, "
@@ -1396,17 +1452,13 @@ def read_raw_export_id(marker: Path) -> str | None:
 
 
 def write_raw_export_marker(marker: Path, export_id: str, archive_links: list[str]) -> None:
-    marker.write_text(
-        json.dumps(
-            {
-                "export_id": export_id,
-                "link_count": len(archive_links),
-                "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
-            },
-            indent=2,
-            sort_keys=True,
-        )
-        + "\n"
+    write_private_json_if_changed(
+        marker,
+        {
+            "export_id": export_id,
+            "link_count": len(archive_links),
+            "version": 1,
+        },
     )
 
 
@@ -2019,14 +2071,24 @@ def wait_for_browser_download(
         if method == "Browser.downloadWillBegin":
             active_guid = params.get("guid", "")
             filename = params.get("suggestedFilename", "") or active_guid
-            if filename and completed_download_exists(raw, filename):
-                if active_guid:
-                    try:
-                        cdp_call(ws, "Browser.cancelDownload", {"guid": active_guid})
-                    except RuntimeError:
-                        pass
-                print(f"already downloaded {filename}")
-                return
+            if filename:
+                status = existing_download_status(raw, filename)
+                if status == "complete":
+                    if active_guid:
+                        try:
+                            cdp_call(ws, "Browser.cancelDownload", {"guid": active_guid})
+                        except RuntimeError:
+                            pass
+                    print(f"already downloaded {filename}")
+                    return
+                if status == "invalid":
+                    if active_guid:
+                        try:
+                            cdp_call(ws, "Browser.cancelDownload", {"guid": active_guid})
+                        except RuntimeError:
+                            pass
+                    remove_incomplete_download(raw, filename)
+                    raise BrowserDownloadCanceled(f"Removed incomplete existing download {filename}")
             print(f"downloading {filename}")
             continue
         if method != "Browser.downloadProgress":
@@ -2040,10 +2102,11 @@ def wait_for_browser_download(
         state = params.get("state")
         if state == "completed":
             last_progress_width = print_download_progress(filename or active_guid, params, last_progress_width, final=True)
+            record_completed_download(raw, filename or active_guid, params)
             print(f"downloaded {filename or active_guid}")
             return
         if state == "canceled":
-            if filename and completed_download_exists(raw, filename):
+            if filename and existing_download_status(raw, filename) == "complete":
                 finish_progress_line(last_progress_width)
                 print(f"downloaded {filename} before browser reported cancellation")
                 return
@@ -2085,17 +2148,71 @@ class BrowserDownloadCanceled(RuntimeError):
     pass
 
 
-def completed_download_exists(raw: Path, filename: str) -> bool:
+def existing_download_status(raw: Path, filename: str) -> str:
     if not filename:
-        return False
+        return "missing"
     path = raw / filename
     if not path.exists() or not path.is_file():
-        return False
+        return "missing"
     if path.name.endswith(".crdownload"):
-        return False
-    if (raw / f"{filename}.crdownload").exists():
-        return False
-    return path.stat().st_size > 0
+        return "invalid"
+    size = path.stat().st_size
+    if size <= 0:
+        return "invalid"
+
+    recorded = load_completed_downloads(raw).get(filename)
+    if recorded:
+        return "complete" if int(recorded.get("size") or -1) == size else "invalid"
+
+    if archive_integrity_ok(path):
+        record_completed_download(raw, filename, {"totalBytes": size})
+        return "complete"
+    return "invalid"
+
+
+def archive_integrity_ok(path: Path) -> bool:
+    result = subprocess.run(
+        ["tar", "-tzf", str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+    return result.returncode == 0
+
+
+def remove_incomplete_download(raw: Path, filename: str) -> None:
+    for path in (raw / filename, raw / f"{filename}.crdownload"):
+        path.unlink(missing_ok=True)
+
+
+def record_completed_download(raw: Path, filename: str, params: dict) -> None:
+    if not filename:
+        return
+    path = raw / filename
+    size = int(params.get("totalBytes") or 0)
+    if path.exists():
+        size = path.stat().st_size
+    if size <= 0:
+        return
+
+    data = load_completed_download_marker(raw)
+    files = data.setdefault("files", {})
+    files[filename] = {
+        "size": size,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+    }
+    write_private_json_if_changed(raw / RAW_DOWNLOADS_MARKER, data)
+
+
+def load_completed_downloads(raw: Path) -> dict:
+    return load_completed_download_marker(raw).get("files", {})
+
+
+def load_completed_download_marker(raw: Path) -> dict:
+    path = raw / RAW_DOWNLOADS_MARKER
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 1, "files": {}}
 
 
 def browser_page_summary(ws) -> dict:
@@ -2190,9 +2307,13 @@ def extract_all(raw: Path, merged: Path) -> None:
                     dups += 1
                 else:
                     other = collision_name(dst, src)
-                    shutil.move(str(src), str(other))
-                    log.write(json.dumps({"collision": str(rel), "wrote": str(other.relative_to(merged))}) + "\n")
-                    collisions += 1
+                    if other.exists() and same(src, other):
+                        src.unlink()
+                        dups += 1
+                    else:
+                        shutil.move(str(src), str(other))
+                        log.write(json.dumps({"collision": str(rel), "wrote": str(other.relative_to(merged))}) + "\n")
+                        collisions += 1
             shutil.rmtree(work)
     shutil.rmtree(temp, ignore_errors=True)
     print(
@@ -2229,6 +2350,8 @@ def collision_name(dst: Path, src: Path) -> Path:
     candidate = dst.with_name(f"{dst.stem}.collision-{h}{dst.suffix}")
     n = 2
     while candidate.exists():
+        if same(candidate, src):
+            return candidate
         candidate = dst.with_name(f"{dst.stem}.collision-{h}-{n}{dst.suffix}")
         n += 1
     return candidate

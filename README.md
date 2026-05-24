@@ -29,6 +29,8 @@ The script searches for `client_secret*.json` in `~/Downloads` and `~/.config/au
 
 It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links, extracts all `.tgz` files into one merged directory, and backs up the raw and merged outputs with restic.
 
+The main flow is designed to be rerunnable. It records a pending Takeout export so reruns wait for the email instead of creating duplicate exports, skips already verified archive downloads, deletes orphaned corrupt partial archives before retrying, merges extraction output without duplicating existing files, and runs restic with `--skip-if-unchanged`.
+
 If Google says `This browser or app may not be secure`, the script was using an automation-controlled browser. Current versions launch normal Brave/Chrome directly for login. Rerun `./autotakeout.py --force-login`; if the dedicated profile is wedged, remove `~/.local/state/autotakeout/browser-profile` and rerun.
 
 If Google asks for your password again before archive downloads, the script prompts for it in the terminal only when needed and never stores it. You can also pass it once with `--google-password`.

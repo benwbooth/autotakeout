@@ -20,6 +20,8 @@ cookies.txt
 links.json
 restic-password
 secrets.json
+pending-export.json
+.autotakeout-*.json
 
 # Local environment files.
 .env
