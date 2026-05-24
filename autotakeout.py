@@ -61,6 +61,7 @@ UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.3
 URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "autotakeout"
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autotakeout" / "config.json"
+SECRETS = STATE / "secrets.json"
 BROWSER_DOWNLOAD_RETRIES = 5
 RAW_EXPORT_MARKER = ".autotakeout-export.json"
 RESTIC_RESTORE_MARKER = ".autotakeout-restore-marker.json"
@@ -601,8 +602,19 @@ def setup_restic(a: argparse.Namespace, *, initialize: bool = True) -> dict:
 
 def b2_env(a: argparse.Namespace) -> dict:
     env = os.environ.copy()
-    key_id = a.b2_key_id or os.environ.get("B2_ACCOUNT_ID") or os.environ.get("B2_APPLICATION_KEY_ID")
-    key = a.b2_key or os.environ.get("B2_ACCOUNT_KEY") or os.environ.get("B2_APPLICATION_KEY")
+    stored = load_secrets().get("backblaze_b2", {})
+    key_id = (
+        a.b2_key_id
+        or os.environ.get("B2_ACCOUNT_ID")
+        or os.environ.get("B2_APPLICATION_KEY_ID")
+        or stored.get("key_id")
+    )
+    key = (
+        a.b2_key
+        or os.environ.get("B2_ACCOUNT_KEY")
+        or os.environ.get("B2_APPLICATION_KEY")
+        or stored.get("key")
+    )
 
     if not key_id:
         key_id = input("Backblaze application key ID: ").strip()
@@ -611,12 +623,42 @@ def b2_env(a: argparse.Namespace) -> dict:
     if not key_id or not key:
         raise SystemExit("Backblaze B2 credentials are required for --restic")
 
+    save_backblaze_b2_secrets(key_id, key)
+
     env["B2_ACCOUNT_ID"] = key_id
     env["B2_ACCOUNT_KEY"] = key
     env["B2_APPLICATION_KEY_ID"] = key_id
     env["B2_APPLICATION_KEY"] = key
     env.setdefault("B2_ACCOUNT_INFO", str(STATE / "b2-account-info.sqlite"))
     return env
+
+
+def load_secrets() -> dict:
+    if not SECRETS.exists():
+        return {}
+    SECRETS.chmod(0o600)
+    try:
+        return json.loads(SECRETS.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Invalid secrets file {SECRETS}: {e}") from e
+
+
+def save_secrets(data: dict) -> None:
+    SECRETS.parent.mkdir(parents=True, exist_ok=True)
+    SECRETS.write_text(json.dumps(data, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    SECRETS.chmod(0o600)
+
+
+def save_backblaze_b2_secrets(key_id: str, key: str) -> None:
+    data = load_secrets()
+    current = data.get("backblaze_b2") or {}
+    updated = {"key_id": key_id, "key": key}
+    if current == updated:
+        return
+
+    data["backblaze_b2"] = updated
+    save_secrets(data)
+    print(f"stored Backblaze B2 credentials: {SECRETS}")
 
 
 def ensure_restic_password_file(path: Path | None, *, create: bool = True) -> Path:

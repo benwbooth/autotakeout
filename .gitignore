@@ -19,6 +19,7 @@ data/
 cookies.txt
 links.json
 restic-password
+secrets.json
 
 # Local environment files.
 .env
