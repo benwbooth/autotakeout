@@ -1512,6 +1512,7 @@ def wait_for_browser_download(
     active_guid = ""
     filename = ""
     last_report = 0.0
+    last_progress_width = 0
     waiting_for_auth = False
     password_submitted = False
     while True:
@@ -1569,24 +1570,46 @@ def wait_for_browser_download(
             active_guid = guid
         state = params.get("state")
         if state == "completed":
+            last_progress_width = print_download_progress(filename or active_guid, params, last_progress_width, final=True)
             print(f"downloaded {filename or active_guid}")
             return
         if state == "canceled":
             if filename and completed_download_exists(raw, filename):
+                finish_progress_line(last_progress_width)
                 print(f"downloaded {filename} before browser reported cancellation")
                 return
+            finish_progress_line(last_progress_width)
             raise BrowserDownloadCanceled(f"Browser canceled download {filename or active_guid}")
 
         now = time.monotonic()
         if now - last_report >= 30:
             last_report = now
-            received = int(params.get("receivedBytes") or 0)
-            total_bytes = int(params.get("totalBytes") or 0)
-            if total_bytes:
-                pct = received * 100 / total_bytes
-                print(f"{filename or active_guid}: {received / 1024**3:.2f}/{total_bytes / 1024**3:.2f} GiB ({pct:.1f}%)")
-            else:
-                print(f"{filename or active_guid}: {received / 1024**3:.2f} GiB")
+            last_progress_width = print_download_progress(filename or active_guid, params, last_progress_width)
+
+
+def print_download_progress(name: str, params: dict, previous_width: int, *, final: bool = False) -> int:
+    received = int(params.get("receivedBytes") or 0)
+    total_bytes = int(params.get("totalBytes") or 0)
+    if final and total_bytes:
+        received = total_bytes
+    if total_bytes:
+        pct = min(100.0, received * 100 / total_bytes)
+        text = f"{name}: {received / 1024**3:.2f}/{total_bytes / 1024**3:.2f} GiB ({pct:.1f}%)"
+    else:
+        text = f"{name}: {received / 1024**3:.2f} GiB"
+    width = max(previous_width, len(text))
+    sys.stdout.write("\r" + text.ljust(width))
+    if final:
+        sys.stdout.write("\n")
+        width = 0
+    sys.stdout.flush()
+    return width
+
+
+def finish_progress_line(previous_width: int) -> None:
+    if previous_width:
+        sys.stdout.write("\r" + " " * previous_width + "\r")
+        sys.stdout.flush()
 
 
 class BrowserDownloadCanceled(RuntimeError):
