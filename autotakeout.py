@@ -64,6 +64,8 @@ CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "aut
 BROWSER_DOWNLOAD_RETRIES = 5
 RAW_EXPORT_MARKER = ".autotakeout-export.json"
 RESTIC_RESTORE_MARKER = ".autotakeout-restore-marker.json"
+RESTIC_VALIDATION_MANIFEST = ".autotakeout-validation.json"
+VALIDATION_METADATA_NAMES = {RAW_EXPORT_MARKER, RESTIC_RESTORE_MARKER, RESTIC_VALIDATION_MANIFEST}
 
 
 def main() -> None:
@@ -110,6 +112,13 @@ def main() -> None:
     )
     p.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
     p.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
+    p.add_argument("--restic-sample-count", type=int, default=5, help="Number of files to restore and hash-check")
+    p.add_argument(
+        "--restic-sample-max-mib",
+        type=int,
+        default=512,
+        help="Maximum sample file size in MiB; 0 disables the limit",
+    )
     p.add_argument("--rclone-remote", help="Run rclone copy after extraction, e.g. b2remote:google-photos")
     p.add_argument("--rclone-sync", action="store_true")
     p.add_argument("--force-login", action="store_true", help="Always open the browser login step first")
@@ -155,6 +164,13 @@ def main() -> None:
     )
     run.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
     run.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
+    run.add_argument("--restic-sample-count", type=int, default=5, help="Number of files to restore and hash-check")
+    run.add_argument(
+        "--restic-sample-max-mib",
+        type=int,
+        default=512,
+        help="Maximum sample file size in MiB; 0 disables the limit",
+    )
 
     links = sub.add_parser("links", help="Print and cache links from the newest Takeout email")
     links.add_argument("--credentials", type=Path)
@@ -237,11 +253,18 @@ def main() -> None:
         if a.restic:
             paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
             marker = write_restic_restore_marker(a.raw)
+            manifest = write_restic_validation_manifest(
+                a.raw,
+                paths,
+                sample_count=a.restic_sample_count,
+                sample_max_mib=a.restic_sample_max_mib,
+            )
             run_restic_backup(restic_plan, paths)
             if a.verify_restic:
                 verify_restic_backup(
                     restic_plan,
                     marker_path=marker,
+                    manifest_path=manifest,
                     subset=a.restic_check_subset,
                     full=a.restic_full_check,
                 )
@@ -254,6 +277,7 @@ def main() -> None:
         verify_restic_backup(
             setup_restic(a, initialize=False),
             marker_path=a.raw / RESTIC_RESTORE_MARKER,
+            manifest_path=a.raw / RESTIC_VALIDATION_MANIFEST,
             subset=a.restic_check_subset,
             full=a.restic_full_check,
         )
@@ -510,12 +534,19 @@ def guided(a: argparse.Namespace) -> None:
         print("6. Running restic backup.")
         paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
         marker = write_restic_restore_marker(a.raw)
+        manifest = write_restic_validation_manifest(
+            a.raw,
+            paths,
+            sample_count=a.restic_sample_count,
+            sample_max_mib=a.restic_sample_max_mib,
+        )
         run_restic_backup(restic_plan, paths)
         if a.verify_restic:
             print("7. Verifying restic backup.")
             verify_restic_backup(
                 restic_plan,
                 marker_path=marker,
+                manifest_path=manifest,
                 subset=a.restic_check_subset,
                 full=a.restic_full_check,
             )
@@ -704,10 +735,40 @@ def write_restic_restore_marker(raw: Path) -> Path:
     return marker
 
 
+def write_restic_validation_manifest(
+    raw: Path,
+    paths: list[Path],
+    *,
+    sample_count: int,
+    sample_max_mib: int,
+) -> Path:
+    roots = [path.resolve() for path in paths]
+    sample_max_bytes = None if sample_max_mib <= 0 else sample_max_mib * 1024**2
+    manifest = {
+        "created_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        "version": 1,
+        "paths": [summarize_local_root(root) for root in roots],
+        "sample_max_bytes": sample_max_bytes,
+        "samples": choose_validation_samples(roots, sample_count, sample_max_bytes),
+    }
+
+    path = raw / RESTIC_VALIDATION_MANIFEST
+    path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    path.chmod(0o600)
+    print(
+        "validation manifest: "
+        f"{sum(item['file_count'] for item in manifest['paths'])} files, "
+        f"{format_bytes(sum(item['total_bytes'] for item in manifest['paths']))}, "
+        f"{len(manifest['samples'])} sample(s)"
+    )
+    return path
+
+
 def verify_restic_backup(
     plan: dict,
     *,
     marker_path: Path | None = None,
+    manifest_path: Path | None = None,
     subset: str | None = "1%",
     full: bool = False,
 ) -> None:
@@ -715,6 +776,12 @@ def verify_restic_backup(
         verify_restic_marker(plan, marker_path)
     else:
         print("No restore marker found; skipping marker dump verification.")
+
+    manifest = load_restic_validation_manifest(plan, manifest_path) if manifest_path else None
+    if manifest:
+        verify_validation_manifest(plan, manifest)
+    else:
+        print("No validation manifest found; skipping count, size, and sample-file verification.")
 
     command = restic_base_command(plan) + ["check"]
     if full:
@@ -729,24 +796,232 @@ def verify_restic_backup(
 def verify_restic_marker(plan: dict, marker_path: Path) -> None:
     expected = marker_path.read_bytes()
     marker = marker_path.resolve()
-    command = restic_base_command(plan) + [
-        "dump",
-        "--tag",
-        "autotakeout",
-        "--path",
-        str(marker.parent),
-        "latest",
-        str(marker),
-    ]
-    restored = subprocess.run(
-        command,
-        env=plan["env"],
-        check=True,
-        stdout=subprocess.PIPE,
-    ).stdout
+    restored = restic_dump_bytes(plan, marker, path_selector=marker.parent)
     if restored != expected:
         raise RuntimeError(f"Restic restore marker mismatch for {marker}")
     print(f"restic marker restore verified: {marker}")
+
+
+def load_restic_validation_manifest(plan: dict, manifest_path: Path | None) -> dict | None:
+    if not manifest_path:
+        return None
+
+    manifest = manifest_path.resolve()
+    local_bytes = manifest.read_bytes() if manifest.exists() else None
+    restored = restic_dump_bytes(plan, manifest, path_selector=manifest.parent, required=local_bytes is not None)
+    if restored is None:
+        return None
+    if local_bytes is not None and restored != local_bytes:
+        raise RuntimeError(f"Restic validation manifest mismatch for {manifest}")
+    print(f"restic validation manifest restore verified: {manifest}")
+    return json.loads(restored.decode("utf-8"))
+
+
+def verify_validation_manifest(plan: dict, manifest: dict) -> None:
+    verify_restic_counts_and_sizes(plan, manifest)
+    verify_local_counts_and_sizes(manifest)
+    verify_restic_samples(plan, manifest)
+
+
+def verify_restic_counts_and_sizes(plan: dict, manifest: dict) -> None:
+    for expected in manifest.get("paths", []):
+        actual = summarize_restic_root(plan, Path(expected["path"]))
+        compare_summary("restic snapshot", expected, actual)
+    print("restic file counts and sizes match validation manifest")
+
+
+def verify_local_counts_and_sizes(manifest: dict) -> None:
+    checked = 0
+    missing = []
+    for expected in manifest.get("paths", []):
+        root = Path(expected["path"])
+        if not root.exists():
+            missing.append(str(root))
+            continue
+        actual = summarize_local_root(root)
+        compare_summary("local filesystem", expected, actual)
+        checked += 1
+
+    if checked:
+        print("local file counts and sizes match validation manifest")
+    if missing:
+        print("local path(s) missing; skipped local comparison for: " + ", ".join(missing))
+
+
+def verify_restic_samples(plan: dict, manifest: dict) -> None:
+    samples = manifest.get("samples", [])
+    if not samples:
+        print("No sample files in validation manifest.")
+        return
+
+    for i, sample in enumerate(samples, 1):
+        digest, size = restic_dump_sha256(
+            plan,
+            Path(sample["path"]),
+            path_selector=Path(sample["root"]),
+        )
+        if size != sample["size"]:
+            raise RuntimeError(f"Restored sample size mismatch for {sample['path']}: {size} != {sample['size']}")
+        if digest != sample["sha256"]:
+            raise RuntimeError(f"Restored sample sha256 mismatch for {sample['path']}")
+        print(f"restic sample {i}/{len(samples)} verified: {sample['relative_path']} ({format_bytes(size)})")
+
+
+def compare_summary(label: str, expected: dict, actual: dict) -> None:
+    fields = ("file_count", "total_bytes")
+    mismatches = [field for field in fields if expected[field] != actual[field]]
+    if mismatches:
+        details = ", ".join(f"{field}: {actual[field]} != {expected[field]}" for field in mismatches)
+        raise RuntimeError(f"{label} summary mismatch for {expected['path']}: {details}")
+
+
+def summarize_local_root(root: Path) -> dict:
+    root = root.resolve()
+    if not root.exists():
+        raise RuntimeError(f"Validation path does not exist: {root}")
+
+    file_count = 0
+    total_bytes = 0
+    for _, path, size in iter_regular_files([root]):
+        file_count += 1
+        total_bytes += size
+    return {"path": str(root), "file_count": file_count, "total_bytes": total_bytes}
+
+
+def summarize_restic_root(plan: dict, root: Path) -> dict:
+    root = root.resolve()
+    command = restic_base_command(plan) + [
+        "ls",
+        "latest",
+        "--tag",
+        "autotakeout",
+        "--path",
+        str(root),
+        "--recursive",
+        "--json",
+        str(root),
+    ]
+    listing = subprocess.run(command, env=plan["env"], check=True, stdout=subprocess.PIPE, text=True).stdout
+    file_count = 0
+    total_bytes = 0
+    for line in listing.splitlines():
+        item = json.loads(line)
+        if item.get("message_type") != "node" or item.get("type") != "file":
+            continue
+        if is_validation_metadata(Path(item["path"])):
+            continue
+        file_count += 1
+        total_bytes += int(item.get("size") or 0)
+    return {"path": str(root), "file_count": file_count, "total_bytes": total_bytes}
+
+
+def choose_validation_samples(roots: list[Path], count: int, max_bytes: int | None) -> list[dict]:
+    if count <= 0:
+        return []
+
+    candidates = []
+    for root, path, size in iter_regular_files(roots):
+        if max_bytes is not None and size > max_bytes:
+            continue
+        candidates.append((hashlib.sha256(str(path).encode("utf-8")).hexdigest(), root, path, size))
+
+    samples = []
+    for _, root, path, size in sorted(candidates)[:count]:
+        samples.append(
+            {
+                "root": str(root),
+                "path": str(path),
+                "relative_path": path.relative_to(root).as_posix(),
+                "size": size,
+                "sha256": sha256_file(path),
+            }
+        )
+    return samples
+
+
+def iter_regular_files(roots: list[Path]):
+    for root in roots:
+        root = root.resolve()
+        for directory, dirnames, filenames in os.walk(root):
+            dirpath = Path(directory)
+            dirnames[:] = [name for name in dirnames if not (dirpath / name).is_symlink()]
+            for name in filenames:
+                candidate = dirpath / name
+                if candidate.is_symlink() or is_validation_metadata(candidate):
+                    continue
+                path = candidate.resolve()
+                try:
+                    stat = path.stat()
+                except FileNotFoundError:
+                    continue
+                if not path.is_file():
+                    continue
+                yield root, path, stat.st_size
+
+
+def is_validation_metadata(path: Path) -> bool:
+    return path.name in VALIDATION_METADATA_NAMES
+
+
+def sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def restic_dump_bytes(
+    plan: dict,
+    path: Path,
+    *,
+    path_selector: Path | None = None,
+    required: bool = True,
+) -> bytes | None:
+    command = restic_dump_command(plan, path, path_selector=path_selector)
+    proc = subprocess.run(command, env=plan["env"], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        if required:
+            sys.stderr.write(proc.stderr.decode("utf-8", "replace"))
+            raise subprocess.CalledProcessError(proc.returncode, command)
+        return None
+    return proc.stdout
+
+
+def restic_dump_sha256(plan: dict, path: Path, *, path_selector: Path | None = None) -> tuple[str, int]:
+    command = restic_dump_command(plan, path, path_selector=path_selector)
+    proc = subprocess.Popen(command, env=plan["env"], stdout=subprocess.PIPE)
+    if proc.stdout is None:
+        raise RuntimeError("restic dump did not provide stdout")
+
+    digest = hashlib.sha256()
+    size = 0
+    for chunk in iter(lambda: proc.stdout.read(1024 * 1024), b""):
+        size += len(chunk)
+        digest.update(chunk)
+
+    rc = proc.wait()
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, command)
+    return digest.hexdigest(), size
+
+
+def restic_dump_command(plan: dict, path: Path, *, path_selector: Path | None = None) -> list[str]:
+    command = restic_base_command(plan) + ["dump", "--tag", "autotakeout"]
+    if path_selector is not None:
+        command.extend(["--path", str(path_selector.resolve())])
+    command.extend(["latest", str(path.resolve())])
+    return command
+
+
+def format_bytes(size: int) -> str:
+    units = ("B", "KiB", "MiB", "GiB", "TiB")
+    value = float(size)
+    for unit in units:
+        if value < 1024 or unit == units[-1]:
+            return f"{value:.1f} {unit}" if unit != "B" else f"{size} B"
+        value /= 1024
+    return f"{size} B"
 
 
 def restic_base_command(plan: dict) -> list[str]:
