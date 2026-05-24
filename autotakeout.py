@@ -85,7 +85,12 @@ def main() -> None:
     p.add_argument("--skip-extract", action="store_true")
     p.add_argument("--downloader", choices=["auto", "browser", "aria2c", "curl"], default="auto")
     p.add_argument("--google-password", help="Google password for Takeout reauth; never stored")
-    p.add_argument("--restic", action="store_true", help="Run restic backup after extraction")
+    p.add_argument(
+        "--restic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run restic backup after extraction; use --no-restic to skip.",
+    )
     p.add_argument("--restic-repo")
     p.add_argument(
         "--restic-password-file",
@@ -120,6 +125,18 @@ def main() -> None:
     run.add_argument("--downloader", choices=["auto", "browser", "aria2c", "curl"], default="auto")
     run.add_argument("--google-password")
     run.add_argument("--force", action="store_true", help="Delete old raw Takeout files without prompting")
+    run.add_argument(
+        "--restic",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Run restic backup after extraction; use --no-restic to skip.",
+    )
+    run.add_argument("--restic-repo")
+    run.add_argument("--restic-password-file", type=Path)
+    run.add_argument("--b2-bucket", help="Backblaze B2 bucket to create/use for restic")
+    run.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
+    run.add_argument("--b2-key-id")
+    run.add_argument("--b2-key")
 
     links = sub.add_parser("links", help="Print and cache links from the newest Takeout email")
     links.add_argument("--credentials", type=Path)
@@ -178,7 +195,8 @@ def main() -> None:
         resolve_preferences(a, raw=True, merged=True)
         extract_all(a.raw, a.merged)
     elif a.cmd == "run":
-        resolve_preferences(a, credentials=True, browser=True, raw=True, merged=True)
+        resolve_preferences(a, credentials=True, browser=True, raw=True, merged=True, restic=a.restic)
+        restic_plan = setup_restic(a) if a.restic else None
         found = find_takeout_links(a.credentials, a.token, a.query, a.max_emails)
         save_links(found)
         print_links(found, show=False)
@@ -187,6 +205,9 @@ def main() -> None:
         download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
         if not a.skip_extract:
             extract_all(a.raw, a.merged)
+        if a.restic:
+            paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
+            run_restic_backup(restic_plan, paths)
     elif a.cmd == "restic":
         if not a.repo:
             raise SystemExit("--repo or RESTIC_REPOSITORY is required")

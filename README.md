@@ -27,7 +27,7 @@ Then run:
 
 The script searches for `client_secret*.json` in `~/Downloads` and `~/.config/autotakeout`; auto-detects Brave/Chrome/Chromium; defaults to `data/raw` and `data/merged`; then saves those preferences to `~/.config/autotakeout/config.json`.
 
-It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links with `aria2c` or `curl`, and extracts all `.tgz` files into one merged directory.
+It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links, extracts all `.tgz` files into one merged directory, and backs up the raw and merged outputs with restic.
 
 If Google says `This browser or app may not be secure`, the script was using an automation-controlled browser. Current versions launch normal Brave/Chrome directly for login. Rerun `./autotakeout.py --force-login`; if the dedicated profile is wedged, remove `~/.local/state/autotakeout/browser-profile` and rerun.
 
@@ -35,11 +35,12 @@ To create or use a Backblaze B2 bucket and initialize restic automatically:
 
 ```sh
 ./autotakeout.py \
-  --restic \
   --b2-bucket globally-unique-bucket-name
 ```
 
 For B2 credentials, set either `B2_ACCOUNT_ID`/`B2_ACCOUNT_KEY` or `B2_APPLICATION_KEY_ID`/`B2_APPLICATION_KEY`. If they are not set, the script prompts for them. It creates `~/.local/state/autotakeout/restic-password` if no `RESTIC_PASSWORD_FILE` is set.
+
+Restic is part of the normal flow. Use `--no-restic` only when you explicitly want to skip backup.
 
 Debug escape hatches:
 
