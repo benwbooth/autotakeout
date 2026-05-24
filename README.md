@@ -54,6 +54,14 @@ To verify an existing configured restic backup without touching Gmail or Takeout
 ./autotakeout.py verify
 ```
 
+To open Backrest against the configured restic repo:
+
+```sh
+./autotakeout.py backrest
+```
+
+This writes an autotakeout-specific Backrest config under `~/.local/state/autotakeout/backrest/` and starts the UI at `http://127.0.0.1:9899`. The backup plan points at the merged Google Photos directory; schedules are disabled so Backrest will not start its own backup while this script is already uploading.
+
 To back up and verify already-downloaded/already-extracted files without touching Gmail or Takeout:
 
 ```sh

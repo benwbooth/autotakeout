@@ -1,4 +1,4 @@
-#!/usr/bin/env -S nix shell --quiet nixpkgs#uv nixpkgs#aria2 nixpkgs#curl nixpkgs#gnutar nixpkgs#restic nixpkgs#rclone nixpkgs#backblaze-b2 --command uv run --script
+#!/usr/bin/env -S nix shell --quiet nixpkgs#uv nixpkgs#aria2 nixpkgs#curl nixpkgs#gnutar nixpkgs#restic nixpkgs#rclone nixpkgs#backblaze-b2 nixpkgs#backrest --command uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -14,6 +14,7 @@
 #   ./autotakeout.py --poll 300 --timeout 0
 #   ./autotakeout.py --b2-bucket my-unique-bucket-name
 #   ./autotakeout.py verify
+#   ./autotakeout.py backrest
 #   ./autotakeout.py --google-password 'your-google-password'
 #
 # Debug escape hatches:
@@ -65,6 +66,9 @@ STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "
 CONFIG = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "autotakeout" / "config.json"
 SECRETS = STATE / "secrets.json"
 PENDING_EXPORT = STATE / "pending-export.json"
+BACKREST_DIR = STATE / "backrest"
+BACKREST_CONFIG = BACKREST_DIR / "config.json"
+BACKREST_DATA = BACKREST_DIR / "data"
 BROWSER_DOWNLOAD_RETRIES = 5
 PENDING_EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 RAW_EXPORT_MARKER = ".autotakeout-export.json"
@@ -1874,6 +1878,116 @@ def setup_restic(a: argparse.Namespace, *, initialize: bool = True, save: bool =
     print(f"restic password file: {password_file}")
     return {"repo": repo, "password_file": password_file, "env": env}
 
+def restic_repo_guid(plan: dict) -> str:
+    command = restic_base_command(plan) + ["cat", "config", "--json"]
+    proc = subprocess.run(command, env=plan["env"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise subprocess.CalledProcessError(proc.returncode, command)
+
+    try:
+        config = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("Could not parse restic repo config JSON") from e
+
+    guid = config.get("id", "")
+    if not re.fullmatch(r"[0-9a-f]{64}", guid):
+        raise RuntimeError(f"Restic repo id is not a 64-character hex value: {guid!r}")
+    return guid
+
+def load_backrest_config(path: Path) -> dict:
+    if not path.exists():
+        return {}
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as e:
+        raise SystemExit(f"Invalid Backrest config file {path}: {e}") from e
+
+def upsert_backrest_item(items: list[dict], item: dict) -> None:
+    for index, existing in enumerate(items):
+        if existing.get("id") == item["id"]:
+            items[index] = {**existing, **item}
+            return
+    items.append(item)
+
+def write_backrest_config(plan: dict, merged: Path, config_path: Path) -> Path:
+    repo_id = "autotakeout-restic"
+    plan_id = "google-photos-merged"
+    password_file = plan["password_file"].expanduser().resolve()
+
+    config = load_backrest_config(config_path)
+    config.setdefault("version", 6)
+    config.setdefault("instance", "autotakeout")
+    config.setdefault("auth", {"disabled": True})
+    repos = config.setdefault("repos", [])
+    plans = config.setdefault("plans", [])
+    if not isinstance(repos, list) or not isinstance(plans, list):
+        raise SystemExit(f"Invalid Backrest config file {config_path}: repos and plans must be lists")
+
+    upsert_backrest_item(
+        repos,
+        {
+            "id": repo_id,
+            "uri": plan["repo"],
+            "guid": restic_repo_guid(plan),
+            "env": [f"RESTIC_PASSWORD_FILE={password_file}"],
+            "autoUnlock": True,
+            "autoInitialize": False,
+            "prunePolicy": {"schedule": {"disabled": True}},
+            "checkPolicy": {"schedule": {"disabled": True}},
+        },
+    )
+    upsert_backrest_item(
+        plans,
+        {
+            "id": plan_id,
+            "repo": repo_id,
+            "paths": [str(merged.expanduser().resolve())],
+            "schedule": {"disabled": True},
+            "retention": {"policyKeepAll": True},
+            "backup_flags": ["--tag autotakeout", "--ignore-inode"],
+            "skipIfUnchanged": True,
+        },
+    )
+
+    write_private_json_if_changed(config_path, config)
+    return config_path
+
+def backrest_display_url(bind_address: str) -> str:
+    if bind_address.startswith(":"):
+        return f"http://127.0.0.1{bind_address}"
+    if bind_address.startswith("0.0.0.0:"):
+        return "http://127.0.0.1:" + bind_address.rsplit(":", 1)[1]
+    return f"http://{bind_address}"
+
+def start_backrest(a: argparse.Namespace) -> None:
+    plan = setup_restic(a, initialize=False, save=False)
+    config_path = (a.backrest_config or BACKREST_CONFIG).expanduser()
+    data_dir = (a.backrest_data or BACKREST_DATA).expanduser()
+    data_dir.mkdir(parents=True, exist_ok=True)
+
+    write_backrest_config(plan, a.merged, config_path)
+    env = plan["env"].copy()
+    env["RESTIC_PASSWORD_FILE"] = str(plan["password_file"].expanduser().resolve())
+
+    restic_cmd = shutil.which("restic") or "restic"
+    command = [
+        "backrest",
+        "-bind-address",
+        a.bind_address,
+        "-config-file",
+        str(config_path),
+        "-data-dir",
+        str(data_dir),
+        "-restic-cmd",
+        restic_cmd,
+    ]
+    print(f"Backrest config: {config_path}", flush=True)
+    print(f"Backrest data: {data_dir}", flush=True)
+    print(f"Backrest URL: {backrest_display_url(a.bind_address)}", flush=True)
+    print("Press Ctrl-C to stop Backrest.", flush=True)
+    subprocess.run(command, env=env, check=True)
+
 def wait_for_takeout_links(
     service,
     *,
@@ -2351,6 +2465,18 @@ def main() -> None:
     verify.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
     verify.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
 
+    backrest = sub.add_parser("backrest", help="Start Backrest connected to the configured restic repo")
+    backrest.add_argument("--merged", type=Path)
+    backrest.add_argument("--restic-repo")
+    backrest.add_argument("--restic-password-file", type=Path)
+    backrest.add_argument("--b2-bucket", help="Backblaze B2 bucket used for restic")
+    backrest.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
+    backrest.add_argument("--b2-key-id")
+    backrest.add_argument("--b2-key")
+    backrest.add_argument("--bind-address", default="127.0.0.1:9899", help="Backrest bind address")
+    backrest.add_argument("--backrest-config", type=Path, help="Backrest config path")
+    backrest.add_argument("--backrest-data", type=Path, help="Backrest data directory")
+
     rclone = sub.add_parser("rclone", help="Run rclone copy/sync")
     rclone.add_argument("source", type=Path)
     rclone.add_argument("remote")
@@ -2434,6 +2560,9 @@ def main() -> None:
             subset=a.restic_check_subset,
             full=a.restic_full_check,
         )
+    elif a.cmd == "backrest":
+        resolve_preferences(a, merged=True, restic=True, save=False)
+        start_backrest(a)
     elif a.cmd == "rclone":
         subprocess.run(["rclone", "sync" if a.sync else "copy", str(a.source), a.remote, "--progress"], check=True)
 
