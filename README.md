@@ -49,3 +49,7 @@ Debug escape hatches:
 ./autotakeout.py download --browser "$(command -v brave)" --raw data/raw
 ./autotakeout.py extract --raw data/raw --merged data/merged
 ```
+
+## License
+
+MIT
