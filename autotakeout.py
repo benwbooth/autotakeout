@@ -340,6 +340,12 @@ def write_private_json_if_changed(path: Path, data: dict) -> None:
     path.write_text(content, encoding="utf-8")
     path.chmod(0o600)
 
+def first_existing_path(paths: list[Path], *, default: Path) -> Path:
+    for path in paths:
+        if path.exists():
+            return path
+    return default
+
 def record_completed_download(raw: Path, filename: str, params: dict) -> None:
     if not filename:
         return
@@ -1586,14 +1592,14 @@ def verify_restic_backup(
     subprocess.run(command, env=plan["env"], check=True)
     print("restic verification completed")
 
-def write_restic_restore_marker(raw: Path) -> Path:
-    raw.mkdir(parents=True, exist_ok=True)
-    marker = raw / RESTIC_RESTORE_MARKER
+def write_restic_restore_marker(root: Path) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
+    marker = root / RESTIC_RESTORE_MARKER
     write_private_json_if_changed(
         marker,
         {
             "purpose": "autotakeout restic restore verification",
-            "raw": str(raw),
+            "root": str(root),
             "version": 1,
         },
     )
@@ -1630,12 +1636,13 @@ def choose_validation_samples(roots: list[Path], count: int, max_bytes: int | No
     return samples
 
 def write_restic_validation_manifest(
-    raw: Path,
+    root: Path,
     paths: list[Path],
     *,
     sample_count: int,
     sample_max_mib: int,
 ) -> Path:
+    root.mkdir(parents=True, exist_ok=True)
     roots = [path.resolve() for path in paths]
     sample_max_bytes = None if sample_max_mib <= 0 else sample_max_mib * 1024**2
     manifest = {
@@ -1645,7 +1652,7 @@ def write_restic_validation_manifest(
         "samples": choose_validation_samples(roots, sample_count, sample_max_bytes),
     }
 
-    path = raw / RESTIC_VALIDATION_MANIFEST
+    path = root / RESTIC_VALIDATION_MANIFEST
     write_private_json_if_changed(path, manifest)
     print(
         "validation manifest: "
@@ -1660,10 +1667,13 @@ def run_backup_flow(a: argparse.Namespace, restic_plan: dict, *, paths: list[Pat
     missing = [path for path in paths if not path.exists()]
     if missing:
         raise SystemExit("Backup path does not exist: " + ", ".join(str(path) for path in missing))
+    if not existing:
+        raise SystemExit("No backup paths were provided")
 
-    marker = write_restic_restore_marker(a.raw)
+    marker_root = existing[0]
+    marker = write_restic_restore_marker(marker_root)
     manifest = write_restic_validation_manifest(
-        a.raw,
+        marker_root,
         existing,
         sample_count=a.restic_sample_count,
         sample_max_mib=a.restic_sample_max_mib,
@@ -1984,7 +1994,10 @@ def guided(a: argparse.Namespace) -> None:
 
     if a.restic:
         print("6. Running restic backup.")
-        run_backup_flow(a, restic_plan, paths=[a.raw] if a.skip_extract else [a.raw, a.merged])
+        if a.skip_extract and not a.merged.exists():
+            print("Skipping restic backup because --skip-extract left no merged output to back up.")
+        else:
+            run_backup_flow(a, restic_plan, paths=[a.merged])
 
     if a.rclone_remote:
         print("6. Running rclone backup.")
@@ -2298,10 +2311,8 @@ def main() -> None:
     ex.add_argument("--raw", type=Path)
     ex.add_argument("--merged", type=Path)
 
-    backup = sub.add_parser("backup", help="Back up existing raw and merged outputs with restic")
-    backup.add_argument("--raw", type=Path)
+    backup = sub.add_parser("backup", help="Back up existing merged output with restic")
     backup.add_argument("--merged", type=Path)
-    backup.add_argument("--skip-merged", action="store_true", help="Back up only raw archives")
     backup.add_argument("--restic-repo")
     backup.add_argument("--restic-password-file", type=Path)
     backup.add_argument("--b2-bucket", help="Backblaze B2 bucket to create/use for restic")
@@ -2330,6 +2341,7 @@ def main() -> None:
 
     verify = sub.add_parser("verify", help="Verify the restic backup")
     verify.add_argument("--raw", type=Path)
+    verify.add_argument("--merged", type=Path)
     verify.add_argument("--restic-repo")
     verify.add_argument("--restic-password-file", type=Path)
     verify.add_argument("--b2-bucket", help="Backblaze B2 bucket used for restic")
@@ -2394,21 +2406,31 @@ def main() -> None:
         else:
             download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
         if a.restic:
-            run_backup_flow(a, restic_plan, paths=[a.raw] if a.skip_extract else [a.raw, a.merged])
+            if a.skip_extract and not a.merged.exists():
+                print("Skipping restic backup because --skip-extract left no merged output to back up.")
+            else:
+                run_backup_flow(a, restic_plan, paths=[a.merged])
     elif a.cmd == "backup":
-        resolve_preferences(a, raw=True, merged=not a.skip_merged, restic=True)
-        paths = [a.raw] if a.skip_merged else [a.raw, a.merged]
-        run_backup_flow(a, setup_restic(a), paths=paths)
+        resolve_preferences(a, merged=True, restic=True)
+        run_backup_flow(a, setup_restic(a), paths=[a.merged])
     elif a.cmd == "restic":
         if not a.repo:
             raise SystemExit("--repo or RESTIC_REPOSITORY is required")
         subprocess.run(["restic", "-r", a.repo, "backup", *map(str, a.paths)], check=True)
     elif a.cmd == "verify":
-        resolve_preferences(a, raw=True, restic=True, save=False)
+        resolve_preferences(a, raw=True, merged=True, restic=True, save=False)
+        marker_path = first_existing_path(
+            [a.merged / RESTIC_RESTORE_MARKER, a.raw / RESTIC_RESTORE_MARKER],
+            default=a.merged / RESTIC_RESTORE_MARKER,
+        )
+        manifest_path = first_existing_path(
+            [a.merged / RESTIC_VALIDATION_MANIFEST, a.raw / RESTIC_VALIDATION_MANIFEST],
+            default=a.merged / RESTIC_VALIDATION_MANIFEST,
+        )
         verify_restic_backup(
             setup_restic(a, initialize=False, save=False),
-            marker_path=a.raw / RESTIC_RESTORE_MARKER,
-            manifest_path=a.raw / RESTIC_VALIDATION_MANIFEST,
+            marker_path=marker_path,
+            manifest_path=manifest_path,
             subset=a.restic_check_subset,
             full=a.restic_full_check,
         )

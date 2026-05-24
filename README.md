@@ -27,7 +27,7 @@ Then run:
 
 The script searches for `client_secret*.json` in `~/Downloads` and `~/.config/autotakeout`; auto-detects Brave/Chrome/Chromium; defaults to `data/raw` and `data/merged`; then saves those preferences to `~/.config/autotakeout/config.json`.
 
-It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links, extracts each completed `.tgz` into one merged directory while the next archive is downloading, and backs up the raw and merged outputs with restic.
+It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links, extracts each completed `.tgz` into one merged directory while the next archive is downloading, and backs up the merged output with restic. The raw `.tgz` directory is not backed up by default.
 
 The default Gmail search only considers Takeout emails from the last 8 days because Google says Takeout archives expire in about 7 days. Override with `--query` if you need a different window.
 
