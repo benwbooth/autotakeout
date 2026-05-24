@@ -27,7 +27,7 @@ Then run:
 
 The script searches for `client_secret*.json` in `~/Downloads` and `~/.config/autotakeout`; auto-detects Brave/Chrome/Chromium; defaults to `data/raw` and `data/merged`; then saves those preferences to `~/.config/autotakeout/config.json`.
 
-It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links, extracts all `.tgz` files into one merged directory, and backs up the raw and merged outputs with restic.
+It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links, extracts each completed `.tgz` into one merged directory while the next archive is downloading, and backs up the raw and merged outputs with restic.
 
 The main flow is designed to be rerunnable. It records a pending Takeout export so reruns wait for the email instead of creating duplicate exports, skips already verified archive downloads, deletes orphaned corrupt partial archives before retrying, merges extraction output without duplicating existing files, and runs restic with `--skip-if-unchanged`.
 

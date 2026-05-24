@@ -30,6 +30,7 @@ import hashlib
 import html
 import json
 import os
+import queue
 import re
 import secrets
 import shutil
@@ -40,6 +41,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import threading
 import time
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlsplit
@@ -256,9 +258,19 @@ def main() -> None:
         print_links(found, show=False)
         archive_links = resolve_archive_download_links(found["links"], a.profile, a.browser)
         prepare_raw_directory(a.raw, archive_links, force=a.force)
-        download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
         if not a.skip_extract:
-            extract_all(a.raw, a.merged)
+            with ExtractionPipeline(a.raw, a.merged) as extractor:
+                download(
+                    archive_links,
+                    a.raw,
+                    a.profile,
+                    a.browser,
+                    a.downloader,
+                    a.google_password,
+                    on_complete=extractor.enqueue,
+                )
+        else:
+            download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
         if a.restic:
             paths = [a.raw] if a.skip_extract else [a.raw, a.merged]
             marker = write_restic_restore_marker(a.raw)
@@ -575,13 +587,21 @@ def guided(a: argparse.Namespace) -> None:
     prepare_raw_directory(a.raw, archive_links, force=a.force)
 
     print("4. Downloading archives.")
-    download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
-
     if a.skip_extract:
+        download(archive_links, a.raw, a.profile, a.browser, a.downloader, a.google_password)
         print("5. Skipping extract.")
     else:
-        print("5. Extracting and merging archives.")
-        extract_all(a.raw, a.merged)
+        print("5. Extracting and merging archives while downloads continue.")
+        with ExtractionPipeline(a.raw, a.merged) as extractor:
+            download(
+                archive_links,
+                a.raw,
+                a.profile,
+                a.browser,
+                a.downloader,
+                a.google_password,
+                on_complete=extractor.enqueue,
+            )
 
     if a.restic:
         print("6. Running restic backup.")
@@ -1923,11 +1943,12 @@ def download(
     browser: Path | None,
     which: str,
     google_password: str | None = None,
+    on_complete=None,
 ) -> None:
     raw.mkdir(parents=True, exist_ok=True)
     tool = choose_downloader(which, browser)
     if tool == "browser":
-        browser_download(links, raw, profile, browser, google_password)
+        browser_download(links, raw, profile, browser, google_password, on_complete=on_complete)
         return
 
     cookie_file = export_cookies(profile, browser)
@@ -1955,6 +1976,7 @@ def download(
                 ],
                 check=True,
             )
+            notify_completed_archives(raw, on_complete)
         finally:
             list_file.unlink(missing_ok=True)
     else:
@@ -1968,6 +1990,7 @@ def download(
                 cwd=raw,
                 check=True,
             )
+            notify_completed_archives(raw, on_complete)
 
 
 def browser_download(
@@ -1976,6 +1999,8 @@ def browser_download(
     profile: Path,
     browser: Path | None,
     google_password: str | None,
+    *,
+    on_complete=None,
 ) -> None:
     if browser is None:
         raise SystemExit("A Chrome/Brave/Chromium executable is required for browser downloads")
@@ -1992,7 +2017,9 @@ def browser_download(
                 print(f"browser download {index}/{len(links)}{suffix}")
                 cdp_call(ws, "Page.navigate", {"url": url})
                 try:
-                    wait_for_browser_download(ws, raw, index, len(links), url, google_password)
+                    filename = wait_for_browser_download(ws, raw, index, len(links), url, google_password)
+                    if filename and on_complete:
+                        on_complete(raw / filename)
                     break
                 except BrowserDownloadCanceled as e:
                     if attempt == BROWSER_DOWNLOAD_RETRIES:
@@ -2019,7 +2046,7 @@ def wait_for_browser_download(
     total: int,
     url: str,
     google_password: str | None,
-) -> None:
+) -> str | None:
     start_deadline = time.monotonic() + 120
     active_guid = ""
     filename = ""
@@ -2080,7 +2107,7 @@ def wait_for_browser_download(
                         except RuntimeError:
                             pass
                     print(f"already downloaded {filename}")
-                    return
+                    return filename
                 if status == "invalid":
                     if active_guid:
                         try:
@@ -2104,12 +2131,12 @@ def wait_for_browser_download(
             last_progress_width = print_download_progress(filename or active_guid, params, last_progress_width, final=True)
             record_completed_download(raw, filename or active_guid, params)
             print(f"downloaded {filename or active_guid}")
-            return
+            return filename or active_guid
         if state == "canceled":
             if filename and existing_download_status(raw, filename) == "complete":
                 finish_progress_line(last_progress_width)
                 print(f"downloaded {filename} before browser reported cancellation")
-                return
+                return filename
             finish_progress_line(last_progress_width)
             raise BrowserDownloadCanceled(f"Browser canceled download {filename or active_guid}")
 
@@ -2146,6 +2173,25 @@ def finish_progress_line(previous_width: int) -> None:
 
 class BrowserDownloadCanceled(RuntimeError):
     pass
+
+
+def notify_completed_archives(raw: Path, on_complete) -> None:
+    if not on_complete:
+        return
+    for archive in completed_archive_files(raw):
+        on_complete(archive)
+
+
+def completed_archive_files(raw: Path) -> list[Path]:
+    if not raw.exists():
+        return []
+    return [
+        path
+        for path in sorted(raw.iterdir())
+        if path.is_file()
+        and path.name.endswith((".tgz", ".tar.gz"))
+        and existing_download_status(raw, path.name) == "complete"
+    ]
 
 
 def existing_download_status(raw: Path, filename: str) -> str:
@@ -2275,25 +2321,120 @@ def choose_downloader(which: str, browser: Path | None) -> str:
     raise SystemExit("Install aria2c or curl")
 
 
+class ExtractionPipeline:
+    def __init__(self, raw: Path, merged: Path) -> None:
+        self.raw = raw
+        self.merged = merged
+        self.queue = queue.Queue()
+        self.lock = threading.Lock()
+        self.enqueued: set[str] = set()
+        self.errors: list[BaseException] = []
+        self.results: list[dict] = []
+        self.closed = False
+        self.thread = threading.Thread(target=self._run, name="autotakeout-extractor", daemon=True)
+
+    def __enter__(self):
+        self.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.close(wait=exc_type is None)
+        return False
+
+    def start(self) -> None:
+        self.merged.mkdir(parents=True, exist_ok=True)
+        self.thread.start()
+        notify_completed_archives(self.raw, self.enqueue)
+
+    def enqueue(self, archive: Path) -> None:
+        archive = Path(archive)
+        if not archive.name.endswith((".tgz", ".tar.gz")) or not archive.exists():
+            return
+        key = str(archive.resolve())
+        with self.lock:
+            if key in self.enqueued:
+                return
+            self.enqueued.add(key)
+        self.queue.put(archive)
+
+    def wait(self) -> None:
+        self.queue.join()
+        self.raise_errors()
+        self.print_summary()
+
+    def close(self, *, wait: bool = True) -> None:
+        if self.closed:
+            return
+        self.closed = True
+        error = None
+        if wait:
+            try:
+                self.wait()
+            except BaseException as e:
+                error = e
+        self.queue.put(None)
+        if wait:
+            self.thread.join()
+            shutil.rmtree(self.merged / ".extracting", ignore_errors=True)
+        if error:
+            raise error
+
+    def _run(self) -> None:
+        while True:
+            archive = self.queue.get()
+            try:
+                if archive is None:
+                    return
+                result = extract_archive(archive, self.merged)
+                with self.lock:
+                    self.results.append(result)
+            except BaseException as e:
+                with self.lock:
+                    self.errors.append(e)
+            finally:
+                self.queue.task_done()
+
+    def raise_errors(self) -> None:
+        with self.lock:
+            errors = list(self.errors)
+        if errors:
+            raise RuntimeError(f"Background extraction failed: {errors[0]}") from errors[0]
+
+    def print_summary(self) -> None:
+        with self.lock:
+            results = list(self.results)
+        if not results:
+            print("no completed archives available to extract yet")
+            return
+        print(extraction_summary(results))
+
+
 def extract_all(raw: Path, merged: Path) -> None:
     archives = sorted([p for p in raw.iterdir() if p.name.endswith((".tgz", ".tar.gz"))])
     if not archives:
         raise SystemExit(f"No .tgz archives found in {raw}")
     merged.mkdir(parents=True, exist_ok=True)
-    temp = merged / ".extracting"
+    results = [extract_archive(archive, merged) for archive in archives]
+    shutil.rmtree(merged / ".extracting", ignore_errors=True)
+    print(extraction_summary(results))
+
+
+def extract_archive(archive: Path, merged: Path) -> dict:
     manifest = merged / "autotakeout-merge-manifest.jsonl"
-    moved = dups = collisions = reports = 0
+    stats = {"archives": 0, "reports": 0, "moved": 0, "duplicates": 0, "collisions": 0}
     with manifest.open("a") as log:
-        for archive in archives:
-            if is_takeout_report_archive(archive):
-                print(f"keeping report archive without merging: {archive}")
-                log.write(json.dumps({"report": str(archive)}) + "\n")
-                reports += 1
-                continue
-            work = temp / archive.name
-            shutil.rmtree(work, ignore_errors=True)
-            work.mkdir(parents=True)
-            print(f"extracting {archive}")
+        if is_takeout_report_archive(archive):
+            print(f"keeping report archive without merging: {archive}")
+            log.write(json.dumps({"report": str(archive)}) + "\n")
+            stats["reports"] = 1
+            return stats
+
+        temp = merged / ".extracting"
+        work = temp / archive.name
+        shutil.rmtree(work, ignore_errors=True)
+        work.mkdir(parents=True)
+        print(f"extracting {archive}")
+        try:
             subprocess.run(["tar", "-xzf", str(archive), "-C", str(work)], check=True)
             for src in sorted(p for p in work.rglob("*") if p.is_file()):
                 rel = src.relative_to(work)
@@ -2301,24 +2442,38 @@ def extract_all(raw: Path, merged: Path) -> None:
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 if not dst.exists():
                     shutil.move(str(src), str(dst))
-                    moved += 1
+                    stats["moved"] += 1
                 elif same(src, dst):
                     src.unlink()
-                    dups += 1
+                    stats["duplicates"] += 1
                 else:
                     other = collision_name(dst, src)
                     if other.exists() and same(src, other):
                         src.unlink()
-                        dups += 1
+                        stats["duplicates"] += 1
                     else:
                         shutil.move(str(src), str(other))
                         log.write(json.dumps({"collision": str(rel), "wrote": str(other.relative_to(merged))}) + "\n")
-                        collisions += 1
-            shutil.rmtree(work)
-    shutil.rmtree(temp, ignore_errors=True)
+                        stats["collisions"] += 1
+        finally:
+            shutil.rmtree(work, ignore_errors=True)
+    stats["archives"] = 1
     print(
-        f"extracted {len(archives) - reports} archives; "
-        f"reports={reports} moved={moved} duplicates={dups} collisions={collisions}"
+        f"extracted {archive.name}; moved={stats['moved']} "
+        f"duplicates={stats['duplicates']} collisions={stats['collisions']}"
+    )
+    return stats
+
+
+def extraction_summary(results: list[dict]) -> str:
+    archives = sum(item.get("archives", 0) for item in results)
+    reports = sum(item.get("reports", 0) for item in results)
+    moved = sum(item.get("moved", 0) for item in results)
+    duplicates = sum(item.get("duplicates", 0) for item in results)
+    collisions = sum(item.get("collisions", 0) for item in results)
+    return (
+        f"extracted {archives} archives; "
+        f"reports={reports} moved={moved} duplicates={duplicates} collisions={collisions}"
     )
 
 
