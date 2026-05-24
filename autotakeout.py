@@ -57,7 +57,7 @@ from websocket import WebSocketTimeoutException, create_connection
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 TAKEOUT_QUERY = (
     '("Google data is ready to download" OR "Your Google data is ready" '
-    'OR "Your Google Takeout export is ready" OR "Takeout") newer_than:30d'
+    'OR "Your Google Takeout export is ready" OR "Takeout") newer_than:8d'
 )
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36"
 URL_RE = re.compile(r"https?://[^\s\"'<>]+")
