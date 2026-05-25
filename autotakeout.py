@@ -2080,6 +2080,12 @@ def remove_stopped_docker_container(docker: str, name: str) -> None:
     if docker_container_exists(docker, name) and not docker_container_running(docker, name):
         subprocess.run([docker, "container", "rm", name], check=True)
 
+def stop_docker_container(docker: str, name: str) -> None:
+    if not docker_container_running(docker, name):
+        return
+    print(f"Stopping Backrest Docker container: {name}", flush=True)
+    subprocess.run([docker, "container", "stop", name], check=False)
+
 def ensure_docker_image(docker: str, image: str) -> None:
     if subprocess.run([docker, "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
         return
@@ -2226,12 +2232,38 @@ def start_backrest(a: argparse.Namespace) -> None:
             index_snapshots=a.index_snapshots,
             open_browser=a.open_browser,
         )
+    print("Press Ctrl-C to stop Backrest.", flush=True)
     if container_running:
-        print("Press Ctrl-C to stop following logs. The existing Backrest container will keep running.", flush=True)
-        subprocess.run([docker, "logs", "-f", a.docker_name], check=False)
-    else:
-        print("Press Ctrl-C to stop Backrest.", flush=True)
-        subprocess.run(command, env=env, check=True)
+        log_command = [docker, "logs", "-f", a.docker_name]
+        proc = subprocess.Popen(log_command)
+        try:
+            rc = proc.wait()
+        except KeyboardInterrupt:
+            stop_docker_container(docker, a.docker_name)
+            raise
+        if rc in (130, -signal.SIGINT):
+            stop_docker_container(docker, a.docker_name)
+            raise KeyboardInterrupt
+        return
+
+    proc = subprocess.Popen(command, env=env)
+    try:
+        rc = proc.wait()
+    except KeyboardInterrupt:
+        stop_docker_container(docker, a.docker_name)
+        raise
+    finally:
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        stop_docker_container(docker, a.docker_name)
+    if rc in (130, -signal.SIGINT):
+        raise KeyboardInterrupt
+    if rc != 0:
+        raise subprocess.CalledProcessError(rc, command)
 
 def wait_for_takeout_links(
     service,
