@@ -2006,12 +2006,32 @@ def open_url(url: str) -> bool:
     except OSError:
         return False
 
-def open_backrest_when_ready(bind_address: str, url: str) -> None:
+def request_backrest_snapshot_index(url: str) -> bool:
+    endpoint = url.rstrip("/") + "/v1.Backrest/DoRepoTask"
+    payload = json.dumps(
+        {
+            "repoId": "autotakeout-restic",
+            "task": "TASK_INDEX_SNAPSHOTS",
+        }
+    ).encode("utf-8")
+    request = Request(endpoint, data=payload, headers={"Content-Type": "application/json"}, method="POST")
+    try:
+        with urlopen(request, timeout=15) as response:
+            response.read()
+        print("Requested Backrest snapshot index.", flush=True)
+        return True
+    except Exception as e:
+        print(f"Could not request Backrest snapshot index automatically: {e}", flush=True)
+        return False
+
+def run_backrest_startup_actions(bind_address: str, url: str, *, index_snapshots: bool, open_browser: bool) -> None:
     def worker() -> None:
         if not wait_for_backrest_listener(bind_address):
             print(f"Backrest did not become reachable yet; open this URL after it starts: {url}", flush=True)
             return
-        if not open_url(url):
+        if index_snapshots:
+            request_backrest_snapshot_index(url)
+        if open_browser and not open_url(url):
             print(f"Could not open a browser automatically; open this URL: {url}", flush=True)
 
     threading.Thread(target=worker, daemon=True).start()
@@ -2042,9 +2062,17 @@ def start_backrest(a: argparse.Namespace) -> None:
     print(f"Backrest config: {config_path}", flush=True)
     print(f"Backrest data: {data_dir}", flush=True)
     print(f"Backrest URL: {url}", flush=True)
+    if a.index_snapshots:
+        print("Indexing Backrest snapshots after the web server starts.", flush=True)
     if a.open_browser:
         print(f"Opening Backrest in your browser. If it does not open, visit: {url}", flush=True)
-        open_backrest_when_ready(a.bind_address, url)
+    if a.index_snapshots or a.open_browser:
+        run_backrest_startup_actions(
+            a.bind_address,
+            url,
+            index_snapshots=a.index_snapshots,
+            open_browser=a.open_browser,
+        )
     print("Press Ctrl-C to stop Backrest.", flush=True)
     subprocess.run(command, env=env, check=True)
 
@@ -2541,6 +2569,12 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Open Backrest in the default browser after the web server starts.",
+    )
+    backrest.add_argument(
+        "--index-snapshots",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Ask Backrest to index restic snapshots after the web server starts.",
     )
 
     rclone = sub.add_parser("rclone", help="Run rclone copy/sync")
