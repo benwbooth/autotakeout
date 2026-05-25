@@ -60,7 +60,7 @@ To open Backrest against the configured restic repo:
 ./autotakeout.py backrest
 ```
 
-This writes an autotakeout-specific Backrest config under `~/.local/state/autotakeout/backrest/`, starts the UI at `http://127.0.0.1:9898`, asks Backrest to index the restic snapshots, and opens it in your browser. If the browser does not open automatically, visit that URL manually. The backup plan points at the merged Google Photos directory; schedules are disabled so Backrest will not start its own backup while this script is already uploading.
+This writes an autotakeout-specific Backrest config under `~/.local/state/autotakeout/backrest/`, checks that Docker is running, starts `garethgeorge/backrest:v1.13.0` at `http://127.0.0.1:9898`, asks Backrest to index the restic snapshots, and opens it in your browser. If the browser does not open automatically, visit that URL manually. The backup plan points at the merged Google Photos directory; schedules are disabled so Backrest will not start its own backup while this script is already uploading.
 
 To back up and verify already-downloaded/already-extracted files without touching Gmail or Takeout:
 

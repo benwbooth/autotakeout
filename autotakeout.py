@@ -1,4 +1,4 @@
-#!/usr/bin/env -S nix shell --quiet nixpkgs#uv nixpkgs#aria2 nixpkgs#curl nixpkgs#gnutar nixpkgs#restic nixpkgs#rclone nixpkgs#backblaze-b2 nixpkgs#backrest --command uv run --script
+#!/usr/bin/env -S nix shell --quiet nixpkgs#uv nixpkgs#aria2 nixpkgs#curl nixpkgs#gnutar nixpkgs#restic nixpkgs#rclone nixpkgs#backblaze-b2 --command uv run --script
 # /// script
 # requires-python = ">=3.11"
 # dependencies = [
@@ -69,6 +69,12 @@ PENDING_EXPORT = STATE / "pending-export.json"
 BACKREST_DIR = STATE / "backrest"
 BACKREST_CONFIG = BACKREST_DIR / "config.json"
 BACKREST_DATA = BACKREST_DIR / "data"
+BACKREST_CACHE = BACKREST_DIR / "cache"
+BACKREST_TMP = BACKREST_DIR / "tmp"
+BACKREST_HOME = BACKREST_DIR / "home"
+BACKREST_RESTORE = BACKREST_DIR / "restores"
+BACKREST_DOCKER_IMAGE = "garethgeorge/backrest:v1.13.0"
+BACKREST_DOCKER_CONTAINER = "autotakeout-backrest"
 BROWSER_DOWNLOAD_RETRIES = 5
 PENDING_EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 RAW_EXPORT_MARKER = ".autotakeout-export.json"
@@ -2036,6 +2042,157 @@ def run_backrest_startup_actions(bind_address: str, url: str, *, index_snapshots
 
     threading.Thread(target=worker, daemon=True).start()
 
+def docker_cli() -> str:
+    docker = shutil.which("docker")
+    if not docker:
+        raise SystemExit("Docker CLI is not on PATH. Install/start Docker, then rerun this command.")
+    return docker
+
+def ensure_docker_running(docker: str) -> None:
+    probe = subprocess.run(
+        [docker, "info", "--format", "{{.ServerVersion}}"],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    if probe.returncode != 0:
+        message = probe.stderr.strip() or probe.stdout.strip() or "docker info failed"
+        raise SystemExit(f"Docker is not running or is not reachable: {message}")
+    print(f"Docker daemon: {probe.stdout.strip()}")
+
+def docker_container_running(docker: str, name: str) -> bool:
+    probe = subprocess.run(
+        [docker, "container", "inspect", "-f", "{{.State.Running}}", name],
+        stdout=subprocess.PIPE,
+        stderr=subprocess.DEVNULL,
+        text=True,
+    )
+    return probe.returncode == 0 and probe.stdout.strip() == "true"
+
+def docker_container_exists(docker: str, name: str) -> bool:
+    return subprocess.run(
+        [docker, "container", "inspect", name],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    ).returncode == 0
+
+def remove_stopped_docker_container(docker: str, name: str) -> None:
+    if docker_container_exists(docker, name) and not docker_container_running(docker, name):
+        subprocess.run([docker, "container", "rm", name], check=True)
+
+def ensure_docker_image(docker: str, image: str) -> None:
+    if subprocess.run([docker, "image", "inspect", image], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+        return
+    print(f"Pulling Backrest Docker image: {image}")
+    subprocess.run([docker, "pull", image], check=True)
+
+def host_port_in_use(bind_address: str) -> bool:
+    target = backrest_socket_target(bind_address)
+    if target is None:
+        return False
+    try:
+        with socket.create_connection(target, timeout=0.25):
+            return True
+    except OSError:
+        return False
+
+def docker_publish_arg(bind_address: str) -> str:
+    target = backrest_socket_target(bind_address)
+    if target is None:
+        raise SystemExit(f"Cannot parse Backrest bind address for Docker: {bind_address}")
+    host, port = target
+    if host in ("", "0.0.0.0", "::"):
+        return f"{port}:{port}"
+    return f"{host}:{port}:{port}"
+
+def docker_mount_arg(source: Path, target: str, *, readonly: bool = False) -> str:
+    parts = ["type=bind", f"source={source}", f"target={target}"]
+    if readonly:
+        parts.append("readonly")
+    return ",".join(parts)
+
+def docker_backrest_command(a: argparse.Namespace, plan: dict, config_path: Path, data_dir: Path) -> list[str]:
+    docker = docker_cli()
+    ensure_docker_running(docker)
+    remove_stopped_docker_container(docker, a.docker_name)
+
+    if not docker_container_running(docker, a.docker_name):
+        if host_port_in_use(a.bind_address):
+            raise SystemExit(
+                f"{a.bind_address} is already in use. Stop the existing Backrest process/container "
+                "or pass --bind-address with a free local port."
+            )
+        ensure_docker_image(docker, a.docker_image)
+
+    for path in (BACKREST_DIR, data_dir, BACKREST_CACHE, BACKREST_TMP, BACKREST_HOME, BACKREST_RESTORE):
+        path.mkdir(parents=True, exist_ok=True)
+
+    _, port = backrest_socket_target(a.bind_address) or ("127.0.0.1", 9898)
+    password_file = plan["password_file"].expanduser().resolve()
+    config_dir = config_path.parent.expanduser().resolve()
+    container_config = f"/config/{config_path.name}"
+    env_names = [
+        "B2_ACCOUNT_ID",
+        "B2_ACCOUNT_KEY",
+        "B2_APPLICATION_KEY_ID",
+        "B2_APPLICATION_KEY",
+    ]
+    command = [
+        docker,
+        "run",
+        "--rm",
+        "--name",
+        a.docker_name,
+        "--hostname",
+        "autotakeout-backrest",
+        "--user",
+        f"{os.getuid()}:{os.getgid()}",
+        "--publish",
+        docker_publish_arg(a.bind_address),
+        "--mount",
+        docker_mount_arg(config_dir, "/config"),
+        "--mount",
+        docker_mount_arg(data_dir.resolve(), "/data"),
+        "--mount",
+        docker_mount_arg(BACKREST_CACHE.resolve(), "/cache"),
+        "--mount",
+        docker_mount_arg(BACKREST_TMP.resolve(), "/tmp"),
+        "--mount",
+        docker_mount_arg(BACKREST_RESTORE.resolve(), "/restore"),
+        "--mount",
+        docker_mount_arg(BACKREST_HOME.resolve(), "/data/home"),
+        "--mount",
+        docker_mount_arg(password_file, str(password_file), readonly=True),
+        "--env",
+        "BACKREST_DATA=/data",
+        "--env",
+        f"BACKREST_CONFIG={container_config}",
+        "--env",
+        f"BACKREST_PORT=0.0.0.0:{port}",
+        "--env",
+        "XDG_CACHE_HOME=/cache",
+        "--env",
+        "TMPDIR=/tmp",
+        "--env",
+        "HOME=/data/home",
+        "--env",
+        f"TZ={os.environ.get('TZ', 'America/Los_Angeles')}",
+    ]
+    for name in env_names:
+        if plan["env"].get(name):
+            command.extend(["--env", name])
+
+    merged = a.merged.expanduser().resolve()
+    if merged.exists():
+        command.extend(["--mount", docker_mount_arg(merged, str(merged), readonly=True)])
+
+    repo_path = Path(plan["repo"]).expanduser()
+    if not plan["repo"].startswith("b2:") and repo_path.exists():
+        command.extend(["--mount", docker_mount_arg(repo_path.resolve(), str(repo_path.resolve()))])
+
+    command.append(a.docker_image)
+    return command
+
 def start_backrest(a: argparse.Namespace) -> None:
     plan = setup_restic(a, initialize=False, save=False)
     config_path = (a.backrest_config or BACKREST_CONFIG).expanduser()
@@ -2046,21 +2203,17 @@ def start_backrest(a: argparse.Namespace) -> None:
     env = plan["env"].copy()
     env["RESTIC_PASSWORD_FILE"] = str(plan["password_file"].expanduser().resolve())
 
-    restic_cmd = shutil.which("restic") or "restic"
-    command = [
-        "backrest",
-        "-bind-address",
-        a.bind_address,
-        "-config-file",
-        str(config_path),
-        "-data-dir",
-        str(data_dir),
-        "-restic-cmd",
-        restic_cmd,
-    ]
+    command = docker_backrest_command(a, plan, config_path, data_dir)
+    docker = docker_cli()
+    container_running = docker_container_running(docker, a.docker_name)
     url = backrest_display_url(a.bind_address)
+    if container_running:
+        print(f"Backrest Docker container is already running: {a.docker_name}", flush=True)
+    else:
+        print(f"Backrest Docker image: {a.docker_image}", flush=True)
     print(f"Backrest config: {config_path}", flush=True)
     print(f"Backrest data: {data_dir}", flush=True)
+    print(f"Backrest restore directory: {BACKREST_RESTORE}", flush=True)
     print(f"Backrest URL: {url}", flush=True)
     if a.index_snapshots:
         print("Indexing Backrest snapshots after the web server starts.", flush=True)
@@ -2073,8 +2226,12 @@ def start_backrest(a: argparse.Namespace) -> None:
             index_snapshots=a.index_snapshots,
             open_browser=a.open_browser,
         )
-    print("Press Ctrl-C to stop Backrest.", flush=True)
-    subprocess.run(command, env=env, check=True)
+    if container_running:
+        print("Press Ctrl-C to stop following logs. The existing Backrest container will keep running.", flush=True)
+        subprocess.run([docker, "logs", "-f", a.docker_name], check=False)
+    else:
+        print("Press Ctrl-C to stop Backrest.", flush=True)
+        subprocess.run(command, env=env, check=True)
 
 def wait_for_takeout_links(
     service,
@@ -2564,6 +2721,8 @@ def main() -> None:
     backrest.add_argument("--bind-address", default="127.0.0.1:9898", help="Backrest bind address")
     backrest.add_argument("--backrest-config", type=Path, help="Backrest config path")
     backrest.add_argument("--backrest-data", type=Path, help="Backrest data directory")
+    backrest.add_argument("--docker-image", default=BACKREST_DOCKER_IMAGE, help="Backrest Docker image to run")
+    backrest.add_argument("--docker-name", default=BACKREST_DOCKER_CONTAINER, help="Backrest Docker container name")
     backrest.add_argument(
         "--open-browser",
         action=argparse.BooleanOptionalAction,
