@@ -1960,6 +1960,62 @@ def backrest_display_url(bind_address: str) -> str:
         return "http://127.0.0.1:" + bind_address.rsplit(":", 1)[1]
     return f"http://{bind_address}"
 
+def backrest_socket_target(bind_address: str) -> tuple[str, int] | None:
+    if bind_address.startswith(":"):
+        return "127.0.0.1", int(bind_address[1:])
+    if bind_address.startswith("[") and "]:" in bind_address:
+        host, port = bind_address.rsplit("]:", 1)
+        return host[1:], int(port)
+    if ":" not in bind_address:
+        return None
+
+    host, port = bind_address.rsplit(":", 1)
+    if host in ("", "0.0.0.0", "::"):
+        host = "127.0.0.1"
+    return host, int(port)
+
+def wait_for_backrest_listener(bind_address: str, timeout_seconds: int = 30) -> bool:
+    target = backrest_socket_target(bind_address)
+    if target is None:
+        time.sleep(2)
+        return True
+
+    deadline = time.monotonic() + timeout_seconds
+    while time.monotonic() < deadline:
+        try:
+            with socket.create_connection(target, timeout=0.5):
+                return True
+        except OSError:
+            time.sleep(0.25)
+    return False
+
+def open_url(url: str) -> bool:
+    if sys.platform == "darwin":
+        command = ["open", url]
+    elif os.name == "nt":
+        command = ["cmd", "/c", "start", "", url]
+    else:
+        opener = shutil.which("xdg-open")
+        if not opener:
+            return False
+        command = [opener, url]
+
+    try:
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+def open_backrest_when_ready(bind_address: str, url: str) -> None:
+    def worker() -> None:
+        if not wait_for_backrest_listener(bind_address):
+            print(f"Backrest did not become reachable yet; open this URL after it starts: {url}", flush=True)
+            return
+        if not open_url(url):
+            print(f"Could not open a browser automatically; open this URL: {url}", flush=True)
+
+    threading.Thread(target=worker, daemon=True).start()
+
 def start_backrest(a: argparse.Namespace) -> None:
     plan = setup_restic(a, initialize=False, save=False)
     config_path = (a.backrest_config or BACKREST_CONFIG).expanduser()
@@ -1982,9 +2038,13 @@ def start_backrest(a: argparse.Namespace) -> None:
         "-restic-cmd",
         restic_cmd,
     ]
+    url = backrest_display_url(a.bind_address)
     print(f"Backrest config: {config_path}", flush=True)
     print(f"Backrest data: {data_dir}", flush=True)
-    print(f"Backrest URL: {backrest_display_url(a.bind_address)}", flush=True)
+    print(f"Backrest URL: {url}", flush=True)
+    if a.open_browser:
+        print(f"Opening Backrest in your browser. If it does not open, visit: {url}", flush=True)
+        open_backrest_when_ready(a.bind_address, url)
     print("Press Ctrl-C to stop Backrest.", flush=True)
     subprocess.run(command, env=env, check=True)
 
@@ -2476,6 +2536,12 @@ def main() -> None:
     backrest.add_argument("--bind-address", default="127.0.0.1:9898", help="Backrest bind address")
     backrest.add_argument("--backrest-config", type=Path, help="Backrest config path")
     backrest.add_argument("--backrest-data", type=Path, help="Backrest data directory")
+    backrest.add_argument(
+        "--open-browser",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Open Backrest in the default browser after the web server starts.",
+    )
 
     rclone = sub.add_parser("rclone", help="Run rclone copy/sync")
     rclone.add_argument("source", type=Path)
