@@ -1569,6 +1569,48 @@ def open_target(target: str | Path) -> bool:
     except OSError:
         return False
 
+def send_mount_signal(proc: subprocess.Popen, sig: int) -> bool:
+    try:
+        if hasattr(os, "killpg"):
+            os.killpg(proc.pid, sig)
+        else:
+            proc.send_signal(sig)
+        return True
+    except (ProcessLookupError, OSError):
+        return False
+
+def stop_restic_mount_process(proc: subprocess.Popen, mountpoint: Path) -> None:
+    if proc.poll() is not None:
+        return
+
+    if not send_mount_signal(proc, signal.SIGINT):
+        return
+
+    try:
+        proc.wait(timeout=10)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if restic_mount_active(mountpoint):
+        print(f"restic mount did not exit yet; unmounting fallback: {mountpoint}", flush=True)
+        unmount_restic_mount(mountpoint)
+
+    try:
+        proc.wait(timeout=5)
+        return
+    except subprocess.TimeoutExpired:
+        pass
+
+    if not send_mount_signal(proc, signal.SIGTERM):
+        return
+
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        send_mount_signal(proc, getattr(signal, "SIGKILL", signal.SIGTERM))
+        proc.wait()
+
 def mount_restic_snapshot(a: argparse.Namespace) -> None:
     plan = setup_restic(a, initialize=False, save=False)
     requested_path = a.snapshot_path.expanduser().resolve() if a.snapshot_path else a.merged.expanduser().resolve()
@@ -1610,17 +1652,12 @@ def mount_restic_snapshot(a: argparse.Namespace) -> None:
     except KeyboardInterrupt:
         raise
     finally:
-        print(f"Unmounting restic mount: {mountpoint}", flush=True)
-        unmount_restic_mount(mountpoint)
-        if proc.poll() is None:
-            proc.terminate()
-            try:
-                proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                proc.kill()
-                proc.wait()
-        if opened_path and restic_mount_active(mountpoint):
-            print(f"Mountpoint is still active, possibly because a file manager is using it: {mountpoint}", flush=True)
+        print(f"Stopping restic mount: {mountpoint}", flush=True)
+        stop_restic_mount_process(proc, mountpoint)
+        if restic_mount_active(mountpoint):
+            print(f"Unmounting restic mount fallback: {mountpoint}", flush=True)
+            if not unmount_restic_mount(mountpoint):
+                print(f"Mountpoint is still active, possibly because a file manager is using it: {mountpoint}", flush=True)
 
 def restic_dump_bytes(
     plan: dict,
