@@ -47,6 +47,10 @@ from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from websocket import WebSocketTimeoutException, create_connection
 
+BACKREST_DOCKER_IMAGE = "garethgeorge/backrest"
+BACKREST_DOCKER_TAG = "v1.13.0"
+BACKREST_DOCKER_IMAGE_REF = f"{BACKREST_DOCKER_IMAGE}:{BACKREST_DOCKER_TAG}"
+
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 TAKEOUT_QUERY = (
     '("Google data is ready to download" OR "Your Google data is ready" '
@@ -66,7 +70,6 @@ BACKREST_TMP = BACKREST_DIR / "tmp"
 BACKREST_HOME = BACKREST_DIR / "home"
 BACKREST_RESTORE = BACKREST_DIR / "restores"
 RESTIC_MOUNTPOINT = STATE / "restic-mount"
-BACKREST_DOCKER_IMAGE = "garethgeorge/backrest:v1.13.0"
 BACKREST_DOCKER_CONTAINER = "autotakeout-backrest"
 BROWSER_DOWNLOAD_RETRIES = 5
 PENDING_EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
@@ -3048,7 +3051,7 @@ def main() -> None:
     backrest.add_argument("--bind-address", default="127.0.0.1:9898", help="Backrest bind address")
     backrest.add_argument("--backrest-config", type=Path, help="Backrest config path")
     backrest.add_argument("--backrest-data", type=Path, help="Backrest data directory")
-    backrest.add_argument("--docker-image", default=BACKREST_DOCKER_IMAGE, help="Backrest Docker image to run")
+    backrest.add_argument("--docker-image", default=BACKREST_DOCKER_IMAGE_REF, help="Backrest Docker image to run")
     backrest.add_argument("--docker-name", default=BACKREST_DOCKER_CONTAINER, help="Backrest Docker container name")
     backrest.add_argument(
         "--open-browser",
