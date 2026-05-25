@@ -1,6 +1,6 @@
 # autotakeout
 
-One self-contained `nix shell` + `uv` script for the Google Takeout email flow.
+One `uv` script for the Google Takeout email flow, with repo-local Nix and Python dependency files.
 
 The script needs one Gmail API OAuth client JSON so it can monitor your inbox for the Takeout email. This is not your Google password or a Takeout archive. It is the downloaded Google Cloud file usually named like `client_secret_...apps.googleusercontent.com.json`.
 
@@ -22,8 +22,11 @@ Gmail setup:
 Then run:
 
 ```sh
+nix develop
 ./autotakeout.py
 ```
+
+If you use direnv, run `direnv allow` once and skip `nix develop` after that.
 
 The script searches for `client_secret*.json` in `~/Downloads` and `~/.config/autotakeout`; auto-detects Brave/Chrome/Chromium; defaults to `data/raw` and `data/merged`; then saves those preferences to `~/.config/autotakeout/config.json`.
 

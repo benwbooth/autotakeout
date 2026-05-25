@@ -1,13 +1,4 @@
-#!/usr/bin/env -S nix shell --quiet nixpkgs#uv nixpkgs#aria2 nixpkgs#curl nixpkgs#gnutar nixpkgs#restic nixpkgs#rclone nixpkgs#backblaze-b2 --command uv run --script
-# /// script
-# requires-python = ">=3.11"
-# dependencies = [
-#   "beautifulsoup4>=4.12.0",
-#   "google-api-python-client>=2.0.0",
-#   "google-auth-oauthlib>=1.0.0",
-#   "websocket-client>=1.8.0",
-# ]
-# ///
+#!/usr/bin/env -S uv run --project .
 #
 # Examples:
 #   ./autotakeout.py

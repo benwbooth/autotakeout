@@ -1,5 +1,6 @@
 __pycache__/
 *.py[cod]
+.direnv/
 .venv/
 
 # Local OAuth/client secrets and tokens.
