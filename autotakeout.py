@@ -1916,12 +1916,41 @@ def upsert_backrest_item(items: list[dict], item: dict) -> None:
             return
     items.append(item)
 
+def remove_invalid_backrest_identity(config: dict) -> None:
+    sync = config.get("sync")
+    if not isinstance(sync, dict):
+        return
+
+    identity = sync.get("identity")
+    if not isinstance(identity, dict):
+        return
+
+    key_id = identity.get("keyId", "")
+    private_key = identity.get("ed25519priv", "")
+    public_key = identity.get("ed25519pub", "")
+    looks_current = (
+        isinstance(key_id, str)
+        and key_id.startswith("ed25519.")
+        and isinstance(private_key, str)
+        and private_key
+        and not private_key.startswith("-----BEGIN ")
+        and isinstance(public_key, str)
+        and public_key
+        and not public_key.startswith("-----BEGIN ")
+    )
+    if looks_current:
+        return
+
+    print("Removing legacy Backrest multihost identity; Backrest will generate a new one.")
+    config.pop("sync", None)
+
 def write_backrest_config(plan: dict, merged: Path, config_path: Path) -> Path:
     repo_id = "autotakeout-restic"
     plan_id = "google-photos-merged"
     password_file = plan["password_file"].expanduser().resolve()
 
     config = load_backrest_config(config_path)
+    remove_invalid_backrest_identity(config)
     config.setdefault("version", 6)
     config.setdefault("instance", "autotakeout")
     config.setdefault("auth", {"disabled": True})
