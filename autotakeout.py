@@ -4,6 +4,7 @@
 #   ./autotakeout.py
 #   ./autotakeout.py --poll 300 --timeout 0
 #   ./autotakeout.py --b2-bucket my-unique-bucket-name
+#   ./autotakeout.py snapshots
 #   ./autotakeout.py verify
 #   ./autotakeout.py mount
 #   ./autotakeout.py backrest
@@ -1393,8 +1394,18 @@ def restic_dump_command(plan: dict, path: Path, *, path_selector: Path | None = 
     command.extend(["latest", str(path.resolve())])
     return command
 
-def restic_snapshots(plan: dict, *, path_filter: Path | None = None) -> list[dict]:
-    command = restic_base_command(plan) + ["snapshots", "--json", "--tag", "autotakeout"]
+def restic_snapshots(
+    plan: dict,
+    *,
+    path_filter: Path | None = None,
+    tag: str | None = "autotakeout",
+    latest: int | None = None,
+) -> list[dict]:
+    command = restic_base_command(plan) + ["snapshots", "--json"]
+    if tag:
+        command.extend(["--tag", tag])
+    if latest:
+        command.extend(["--latest", str(latest)])
     if path_filter is not None:
         command.extend(["--path", str(path_filter)])
 
@@ -1423,6 +1434,65 @@ def snapshot_short_id(snapshot: dict) -> str:
     if isinstance(snapshot_id, str) and snapshot_id:
         return snapshot_id[:8]
     raise RuntimeError(f"Snapshot has no id: {snapshot}")
+
+def snapshot_paths_text(snapshot: dict) -> str:
+    return ", ".join(str(path) for path in snapshot.get("paths") or [])
+
+def snapshot_tags_text(snapshot: dict) -> str:
+    return ",".join(str(tag) for tag in snapshot.get("tags") or [])
+
+def print_restic_snapshots(snapshots: list[dict]) -> None:
+    if not snapshots:
+        print("No restic snapshots found.")
+        return
+
+    rows = []
+    for snapshot in sorted(snapshots, key=snapshot_time_key):
+        rows.append(
+            {
+                "id": snapshot_short_id(snapshot),
+                "time": str(snapshot.get("time") or ""),
+                "host": str(snapshot.get("hostname") or ""),
+                "tags": snapshot_tags_text(snapshot),
+                "paths": snapshot_paths_text(snapshot),
+            }
+        )
+
+    widths = {
+        "id": max(8, max(len(row["id"]) for row in rows)),
+        "time": max(4, max(len(row["time"]) for row in rows)),
+        "host": max(4, max(len(row["host"]) for row in rows)),
+        "tags": max(4, max(len(row["tags"]) for row in rows)),
+    }
+    print(
+        f"{'ID':<{widths['id']}}  "
+        f"{'Time':<{widths['time']}}  "
+        f"{'Host':<{widths['host']}}  "
+        f"{'Tags':<{widths['tags']}}  "
+        "Paths"
+    )
+    for row in rows:
+        print(
+            f"{row['id']:<{widths['id']}}  "
+            f"{row['time']:<{widths['time']}}  "
+            f"{row['host']:<{widths['host']}}  "
+            f"{row['tags']:<{widths['tags']}}  "
+            f"{row['paths']}"
+        )
+
+def list_restic_snapshots(a: argparse.Namespace) -> None:
+    plan = setup_restic(a, initialize=False, save=False, quiet=a.json)
+    path_filter = a.path.expanduser().resolve() if a.path else None
+    snapshots = restic_snapshots(
+        plan,
+        path_filter=path_filter,
+        tag=None if a.all else "autotakeout",
+        latest=a.latest,
+    )
+    if a.json:
+        print(json.dumps(sorted(snapshots, key=snapshot_time_key), indent=2))
+    else:
+        print_restic_snapshots(snapshots)
 
 def select_restic_snapshot(plan: dict, snapshot: str | None, *, path_filter: Path | None = None) -> dict:
     snapshots = restic_snapshots(plan, path_filter=path_filter)
@@ -2115,7 +2185,13 @@ def save_config(config: dict) -> None:
     CONFIG.write_text(json.dumps(config, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     CONFIG.chmod(0o600)
 
-def setup_restic(a: argparse.Namespace, *, initialize: bool = True, save: bool = True) -> dict:
+def setup_restic(
+    a: argparse.Namespace,
+    *,
+    initialize: bool = True,
+    save: bool = True,
+    quiet: bool = False,
+) -> dict:
     repo = a.restic_repo
     bucket = bucket_from_restic_repo(repo) or a.b2_bucket
     if not repo:
@@ -2145,8 +2221,9 @@ def setup_restic(a: argparse.Namespace, *, initialize: bool = True, save: bool =
         config["b2_prefix"] = a.b2_prefix
         save_config(config)
 
-    print(f"restic repo: {repo}")
-    print(f"restic password file: {password_file}")
+    if not quiet:
+        print(f"restic repo: {repo}")
+        print(f"restic password file: {password_file}")
     return {"repo": repo, "password_file": password_file, "env": env}
 
 def restic_repo_guid(plan: dict) -> str:
@@ -3010,6 +3087,18 @@ def main() -> None:
     restic.add_argument("paths", nargs="+", type=Path)
     restic.add_argument("--repo", default=os.environ.get("RESTIC_REPOSITORY"))
 
+    snapshots = sub.add_parser("snapshots", help="List restic snapshots")
+    snapshots.add_argument("--restic-repo")
+    snapshots.add_argument("--restic-password-file", type=Path)
+    snapshots.add_argument("--b2-bucket", help="Backblaze B2 bucket used for restic")
+    snapshots.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
+    snapshots.add_argument("--b2-key-id")
+    snapshots.add_argument("--b2-key")
+    snapshots.add_argument("--path", type=Path, help="Only list snapshots containing this path")
+    snapshots.add_argument("--latest", type=int, help="Only show the latest N snapshots")
+    snapshots.add_argument("--all", action="store_true", help="List all snapshots, not just autotakeout-tagged snapshots")
+    snapshots.add_argument("--json", action="store_true", help="Print raw restic snapshots JSON")
+
     verify = sub.add_parser("verify", help="Verify the restic backup")
     verify.add_argument("--raw", type=Path)
     verify.add_argument("--merged", type=Path)
@@ -3132,6 +3221,9 @@ def main() -> None:
         if not a.repo:
             raise SystemExit("--repo or RESTIC_REPOSITORY is required")
         subprocess.run(["restic", "-r", a.repo, "backup", *map(str, a.paths)], check=True)
+    elif a.cmd == "snapshots":
+        resolve_preferences(a, restic=True, save=False)
+        list_restic_snapshots(a)
     elif a.cmd == "verify":
         resolve_preferences(a, raw=True, merged=True, restic=True, save=False)
         marker_path = first_existing_path(

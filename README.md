@@ -57,6 +57,14 @@ To verify an existing configured restic backup without touching Gmail or Takeout
 ./autotakeout.py verify
 ```
 
+To list snapshots in the configured restic repo:
+
+```sh
+./autotakeout.py snapshots
+```
+
+By default this lists only `autotakeout`-tagged snapshots. Use `--all` to show every snapshot in the repo, `--latest N` to limit the output, or `--json` for restic's raw snapshot JSON.
+
 To browse the latest restic snapshot in your file manager:
 
 ```sh
