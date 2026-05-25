@@ -57,6 +57,18 @@ To verify an existing configured restic backup without touching Gmail or Takeout
 ./autotakeout.py verify
 ```
 
+To browse the latest restic snapshot in your file manager:
+
+```sh
+./autotakeout.py mount
+```
+
+This FUSE-mounts the configured restic repo under `~/.local/state/autotakeout/restic-mount`, opens the selected snapshot's merged Google Photos directory with `xdg-open` on Linux or `open` on macOS, and keeps the mount alive until you press `Ctrl-C`. To browse an older snapshot, pass its snapshot ID or unique prefix:
+
+```sh
+./autotakeout.py mount c8fe8077
+```
+
 To open Backrest against the configured restic repo:
 
 ```sh

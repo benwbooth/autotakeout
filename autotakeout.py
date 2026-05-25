@@ -5,6 +5,7 @@
 #   ./autotakeout.py --poll 300 --timeout 0
 #   ./autotakeout.py --b2-bucket my-unique-bucket-name
 #   ./autotakeout.py verify
+#   ./autotakeout.py mount
 #   ./autotakeout.py backrest
 #   ./autotakeout.py --google-password 'your-google-password'
 #
@@ -64,6 +65,7 @@ BACKREST_CACHE = BACKREST_DIR / "cache"
 BACKREST_TMP = BACKREST_DIR / "tmp"
 BACKREST_HOME = BACKREST_DIR / "home"
 BACKREST_RESTORE = BACKREST_DIR / "restores"
+RESTIC_MOUNTPOINT = STATE / "restic-mount"
 BACKREST_DOCKER_IMAGE = "garethgeorge/backrest:v1.13.0"
 BACKREST_DOCKER_CONTAINER = "autotakeout-backrest"
 BROWSER_DOWNLOAD_RETRIES = 5
@@ -1388,6 +1390,238 @@ def restic_dump_command(plan: dict, path: Path, *, path_selector: Path | None = 
     command.extend(["latest", str(path.resolve())])
     return command
 
+def restic_snapshots(plan: dict, *, path_filter: Path | None = None) -> list[dict]:
+    command = restic_base_command(plan) + ["snapshots", "--json", "--tag", "autotakeout"]
+    if path_filter is not None:
+        command.extend(["--path", str(path_filter)])
+
+    proc = subprocess.run(command, env=plan["env"], text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if proc.returncode != 0:
+        sys.stderr.write(proc.stderr)
+        raise subprocess.CalledProcessError(proc.returncode, command)
+
+    try:
+        snapshots = json.loads(proc.stdout)
+    except json.JSONDecodeError as e:
+        raise RuntimeError("Could not parse restic snapshots JSON") from e
+
+    if not isinstance(snapshots, list):
+        raise RuntimeError("Unexpected restic snapshots JSON shape")
+    return snapshots
+
+def snapshot_time_key(snapshot: dict) -> str:
+    return str(snapshot.get("time") or "")
+
+def snapshot_short_id(snapshot: dict) -> str:
+    short_id = snapshot.get("short_id")
+    if isinstance(short_id, str) and short_id:
+        return short_id
+    snapshot_id = snapshot.get("id")
+    if isinstance(snapshot_id, str) and snapshot_id:
+        return snapshot_id[:8]
+    raise RuntimeError(f"Snapshot has no id: {snapshot}")
+
+def select_restic_snapshot(plan: dict, snapshot: str | None, *, path_filter: Path | None = None) -> dict:
+    snapshots = restic_snapshots(plan, path_filter=path_filter)
+    if not snapshots and path_filter is not None:
+        print(f"No autotakeout snapshots matched {path_filter}; checking all autotakeout snapshots.")
+        snapshots = restic_snapshots(plan)
+    if not snapshots:
+        raise SystemExit("No autotakeout restic snapshots found")
+
+    if snapshot and snapshot != "latest":
+        matches = [
+            item
+            for item in snapshots
+            if str(item.get("id") or "").startswith(snapshot) or str(item.get("short_id") or "").startswith(snapshot)
+        ]
+        if not matches:
+            raise SystemExit(f"No autotakeout restic snapshot matched {snapshot!r}")
+        if len(matches) > 1:
+            ids = ", ".join(snapshot_short_id(item) for item in matches)
+            raise SystemExit(f"Snapshot prefix {snapshot!r} is ambiguous: {ids}")
+        return matches[0]
+
+    return sorted(snapshots, key=snapshot_time_key)[-1]
+
+def snapshot_mount_path(mountpoint: Path, snapshot: dict, snapshot_path: Path | None) -> Path:
+    root = mountpoint / "ids" / snapshot_short_id(snapshot)
+    if snapshot_path is None:
+        return root
+    path = snapshot_path.expanduser()
+    if str(path) in ("", "."):
+        return root
+    if path.is_absolute():
+        try:
+            return root / path.relative_to("/")
+        except ValueError:
+            return root
+    return root / path
+
+def choose_snapshot_browse_path(snapshot: dict, requested_path: Path | None) -> Path | None:
+    paths = [str(path) for path in snapshot.get("paths") or [] if str(path)]
+    if requested_path is None:
+        return Path(paths[0]) if paths else None
+
+    requested = requested_path.expanduser()
+    requested_text = str(requested)
+    if requested_text in paths:
+        return requested
+
+    requested_resolved = requested.resolve()
+    for raw in paths:
+        candidate = Path(raw).expanduser()
+        if candidate.is_absolute() and candidate == requested_resolved:
+            return candidate
+        if not candidate.is_absolute() and (Path.cwd() / candidate).resolve() == requested_resolved:
+            return candidate
+
+    if paths:
+        print(f"Configured browse path is not in the snapshot; opening snapshot path: {paths[0]}")
+        return Path(paths[0])
+    return None
+
+def restic_mount_active(mountpoint: Path) -> bool:
+    if not mountpoint.exists():
+        return False
+    if os.name != "nt":
+        mountpoint_bin = shutil.which("mountpoint")
+        if mountpoint_bin:
+            return subprocess.run(
+                [mountpoint_bin, "-q", str(mountpoint)],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            ).returncode == 0
+    return mountpoint.is_mount()
+
+def unmount_restic_mount(mountpoint: Path) -> bool:
+    if os.name == "nt":
+        return False
+
+    commands: list[list[str]] = []
+    if sys.platform == "darwin":
+        commands.append(["umount", str(mountpoint)])
+    else:
+        for name in ("fusermount3", "fusermount"):
+            if binary := shutil.which(name):
+                commands.append([binary, "-u", str(mountpoint)])
+                commands.append([binary, "-uz", str(mountpoint)])
+        commands.append(["umount", str(mountpoint)])
+
+    for command in commands:
+        if shutil.which(command[0]) is None and "/" not in command[0]:
+            continue
+        proc = subprocess.run(command, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, text=True)
+        if proc.returncode == 0:
+            return True
+    return False
+
+def prepare_restic_mountpoint(mountpoint: Path) -> Path:
+    mountpoint = mountpoint.expanduser()
+    mountpoint.mkdir(parents=True, exist_ok=True)
+
+    if restic_mount_active(mountpoint):
+        print(f"Unmounting existing restic mount: {mountpoint}")
+        if not unmount_restic_mount(mountpoint):
+            raise SystemExit(f"Could not unmount existing mountpoint: {mountpoint}")
+
+    try:
+        non_mount_entries = list(mountpoint.iterdir())
+    except OSError:
+        non_mount_entries = []
+    if non_mount_entries:
+        raise SystemExit(f"Mountpoint is not empty: {mountpoint}")
+    return mountpoint
+
+def wait_for_restic_mount(proc: subprocess.Popen, target: Path, fallback: Path, timeout_seconds: int = 30) -> Path:
+    deadline = time.monotonic() + timeout_seconds
+    fallback_seen_at: float | None = None
+    while time.monotonic() < deadline:
+        rc = proc.poll()
+        if rc is not None:
+            raise RuntimeError(f"restic mount exited early with status {rc}")
+        if target.exists():
+            return target
+        if fallback.exists():
+            fallback_seen_at = fallback_seen_at or time.monotonic()
+            if time.monotonic() - fallback_seen_at >= 3:
+                return fallback
+        time.sleep(0.25)
+    if fallback.exists():
+        return fallback
+    raise TimeoutError(f"Timed out waiting for restic mount at {target}")
+
+def open_target(target: str | Path) -> bool:
+    value = str(target)
+    if sys.platform == "darwin":
+        command = ["open", value]
+    elif os.name == "nt":
+        command = ["cmd", "/c", "start", "", value]
+    else:
+        opener = shutil.which("xdg-open")
+        if not opener:
+            return False
+        command = [opener, value]
+
+    try:
+        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        return True
+    except OSError:
+        return False
+
+def mount_restic_snapshot(a: argparse.Namespace) -> None:
+    plan = setup_restic(a, initialize=False, save=False)
+    requested_path = a.snapshot_path.expanduser().resolve() if a.snapshot_path else a.merged.expanduser().resolve()
+    snapshot = select_restic_snapshot(plan, a.snapshot, path_filter=requested_path)
+    short_id = snapshot_short_id(snapshot)
+    snapshot_time = snapshot.get("time", "unknown time")
+    snapshot_paths = ", ".join(snapshot.get("paths") or [])
+    browse_path = choose_snapshot_browse_path(snapshot, requested_path)
+    mountpoint = prepare_restic_mountpoint(a.mountpoint)
+
+    command = restic_base_command(plan) + [
+        "mount",
+        "--tag",
+        "autotakeout",
+        "--path-template",
+        "ids/%i",
+        str(mountpoint),
+    ]
+    print(f"Mounting restic repo: {plan['repo']}")
+    print(f"Selected snapshot: {short_id} ({snapshot_time})")
+    if snapshot_paths:
+        print(f"Snapshot paths: {snapshot_paths}")
+    print(f"Mountpoint: {mountpoint}")
+
+    proc = subprocess.Popen(command, env=plan["env"], start_new_session=True)
+    opened_path: Path | None = None
+    try:
+        fallback = mountpoint / "ids" / short_id
+        target = snapshot_mount_path(mountpoint, snapshot, browse_path)
+        opened_path = wait_for_restic_mount(proc, target, fallback)
+        print(f"Browse path: {opened_path}")
+        if a.open and not open_target(opened_path):
+            print(f"Could not open a file manager automatically; open this path: {opened_path}")
+        elif a.open:
+            print(f"Opened file manager. If it did not appear, open: {opened_path}")
+        print("Press Ctrl-C to unmount and exit.")
+        while proc.poll() is None:
+            time.sleep(1)
+    except KeyboardInterrupt:
+        raise
+    finally:
+        print(f"Unmounting restic mount: {mountpoint}", flush=True)
+        unmount_restic_mount(mountpoint)
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                proc.wait()
+        if opened_path and restic_mount_active(mountpoint):
+            print(f"Mountpoint is still active, possibly because a file manager is using it: {mountpoint}", flush=True)
+
 def restic_dump_bytes(
     plan: dict,
     path: Path,
@@ -2016,21 +2250,7 @@ def wait_for_backrest_listener(bind_address: str, timeout_seconds: int = 30) -> 
     return False
 
 def open_url(url: str) -> bool:
-    if sys.platform == "darwin":
-        command = ["open", url]
-    elif os.name == "nt":
-        command = ["cmd", "/c", "start", "", url]
-    else:
-        opener = shutil.which("xdg-open")
-        if not opener:
-            return False
-        command = [opener, url]
-
-    try:
-        subprocess.Popen(command, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        return True
-    except OSError:
-        return False
+    return open_target(url)
 
 def request_backrest_snapshot_index(url: str) -> bool:
     endpoint = url.rstrip("/") + "/v1.Backrest/DoRepoTask"
@@ -2762,6 +2982,24 @@ def main() -> None:
     verify.add_argument("--restic-check-subset", default="1%", help="Subset for restic check --read-data-subset")
     verify.add_argument("--restic-full-check", action="store_true", help="Run restic check --read-data")
 
+    mount = sub.add_parser("mount", help="FUSE-mount and browse a restic snapshot")
+    mount.add_argument("snapshot", nargs="?", help="Snapshot ID/prefix to browse; defaults to latest")
+    mount.add_argument("--merged", type=Path)
+    mount.add_argument("--path", dest="snapshot_path", type=Path, help="Path inside the snapshot to open")
+    mount.add_argument("--mountpoint", type=Path, default=RESTIC_MOUNTPOINT, help="Local FUSE mountpoint")
+    mount.add_argument("--restic-repo")
+    mount.add_argument("--restic-password-file", type=Path)
+    mount.add_argument("--b2-bucket", help="Backblaze B2 bucket used for restic")
+    mount.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
+    mount.add_argument("--b2-key-id")
+    mount.add_argument("--b2-key")
+    mount.add_argument(
+        "--open",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Open the selected snapshot path in the platform file manager.",
+    )
+
     backrest = sub.add_parser("backrest", help="Start Backrest connected to the configured restic repo")
     backrest.add_argument("--merged", type=Path)
     backrest.add_argument("--restic-repo")
@@ -2871,6 +3109,9 @@ def main() -> None:
             subset=a.restic_check_subset,
             full=a.restic_full_check,
         )
+    elif a.cmd == "mount":
+        resolve_preferences(a, merged=True, restic=True, save=False)
+        mount_restic_snapshot(a)
     elif a.cmd == "backrest":
         resolve_preferences(a, merged=True, restic=True, save=False)
         start_backrest(a)

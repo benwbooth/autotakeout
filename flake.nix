@@ -24,16 +24,21 @@
         in
         {
           default = pkgs.mkShell {
-            packages = with pkgs; [
-              aria2
-              backblaze-b2
-              curl
-              docker-client
-              gnutar
-              restic
-              rclone
-              uv
-            ];
+            packages =
+              with pkgs;
+              [
+                aria2
+                backblaze-b2
+                curl
+                docker-client
+                gnutar
+                restic
+                rclone
+                uv
+              ]
+              ++ pkgs.lib.optionals pkgs.stdenv.isLinux [
+                fuse3
+              ];
           };
         }
       );
