@@ -28,9 +28,15 @@ nix develop
 
 If you use direnv, run `direnv allow` once and skip `nix develop` after that.
 
-The script searches for `client_secret*.json` in `~/Downloads` and `~/.config/autotakeout`; auto-detects Brave/Chrome/Chromium; defaults to `data/raw` and `data/merged`; then saves those preferences to `~/.config/autotakeout/config.json`.
+The script searches for `client_secret*.json` in `~/Downloads` and `~/.config/autotakeout`; auto-detects Brave/Chrome/Chromium; defaults to Google Photos, Gmail/Mail, Google Drive, `data/raw`, and `data/merged`; then saves those preferences to `~/.config/autotakeout/config.json`.
 
 It checks Gmail auth, checks browser login, opens Takeout if an export is not ready yet, waits on Gmail, downloads the archive links, extracts each completed `.tgz` into one merged directory while the next archive is downloading, and backs up the merged output with restic. The raw `.tgz` directory is not backed up by default.
+
+The accepted product aliases are `photos`, `drive`, `gmail`, and `mail`. The selected products are saved in the config file for future runs. To export only Photos:
+
+```sh
+./autotakeout.py --products photos
+```
 
 The default Gmail search only considers Takeout emails from the last 8 days because Google says Takeout archives expire in about 7 days. Override with `--query` if you need a different window.
 
@@ -71,7 +77,7 @@ To browse the latest restic snapshot in your file manager:
 ./autotakeout.py mount
 ```
 
-This FUSE-mounts the configured restic repo under `~/.local/state/autotakeout/restic-mount`, opens the selected snapshot's merged Google Photos directory with `xdg-open` on Linux or `open` on macOS, and keeps the mount alive until you press `Ctrl-C`. To browse an older snapshot, pass its snapshot ID or unique prefix:
+This FUSE-mounts the configured restic repo under `~/.local/state/autotakeout/restic-mount`, opens the selected snapshot's merged Takeout directory with `xdg-open` on Linux or `open` on macOS, and keeps the mount alive until you press `Ctrl-C`. To browse an older snapshot, pass its snapshot ID or unique prefix:
 
 ```sh
 ./autotakeout.py mount c8fe8077
@@ -83,7 +89,7 @@ To open Backrest against the configured restic repo:
 ./autotakeout.py backrest
 ```
 
-This writes an autotakeout-specific Backrest config under `~/.local/state/autotakeout/backrest/`, checks that Docker is running, starts `garethgeorge/backrest:v1.13.0` at `http://127.0.0.1:9898`, asks Backrest to index the restic snapshots, and opens it in your browser. Press `Ctrl-C` in the terminal to stop the Backrest container. If the browser does not open automatically, visit that URL manually. The backup plan points at the merged Google Photos directory; schedules are disabled so Backrest will not start its own backup while this script is already uploading.
+This writes an autotakeout-specific Backrest config under `~/.local/state/autotakeout/backrest/`, checks that Docker is running, starts `garethgeorge/backrest:v1.13.0` at `http://127.0.0.1:9898`, asks Backrest to index the restic snapshots, and opens it in your browser. Press `Ctrl-C` in the terminal to stop the Backrest container. If the browser does not open automatically, visit that URL manually. The backup plan points at the merged Takeout directory; schedules are disabled so Backrest will not start its own backup while this script is already uploading.
 
 To back up and verify already-downloaded/already-extracted files without touching Gmail or Takeout:
 

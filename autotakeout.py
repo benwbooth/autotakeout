@@ -2,6 +2,7 @@
 #
 # Examples:
 #   ./autotakeout.py
+#   ./autotakeout.py --products photos
 #   ./autotakeout.py --poll 300 --timeout 0
 #   ./autotakeout.py --b2-bucket my-unique-bucket-name
 #   ./autotakeout.py snapshots
@@ -51,6 +52,19 @@ from websocket import WebSocketTimeoutException, create_connection
 BACKREST_DOCKER_IMAGE = "garethgeorge/backrest"
 BACKREST_DOCKER_TAG = "v1.13.0"
 BACKREST_DOCKER_IMAGE_REF = f"{BACKREST_DOCKER_IMAGE}:{BACKREST_DOCKER_TAG}"
+LEGACY_DEFAULT_TAKEOUT_PRODUCTS = ("Google Photos",)
+DEFAULT_TAKEOUT_PRODUCTS = ("Google Photos", "Mail", "Drive")
+TAKEOUT_PRODUCTS_CONFIG_VERSION = 2
+TAKEOUT_PRODUCT_ALIASES = {
+    "photos": "Google Photos",
+    "google photos": "Google Photos",
+    "googlephotos": "Google Photos",
+    "drive": "Drive",
+    "google drive": "Drive",
+    "googledrive": "Drive",
+    "gmail": "Mail",
+    "mail": "Mail",
+}
 
 SCOPES = ["https://www.googleapis.com/auth/gmail.readonly"]
 TAKEOUT_QUERY = (
@@ -87,10 +101,45 @@ VALIDATION_METADATA_NAMES = {
 
 CDP_PENDING: dict[int, list[dict]] = {}
 
+def normalize_takeout_product(value: str) -> str:
+    key = re.sub(r"[-_\s]+", " ", value.strip().lower())
+    key = key.replace(" ", "") if key not in TAKEOUT_PRODUCT_ALIASES else key
+    if key in TAKEOUT_PRODUCT_ALIASES:
+        return TAKEOUT_PRODUCT_ALIASES[key]
+    supported = ", ".join(sorted(TAKEOUT_PRODUCT_ALIASES))
+    raise SystemExit(f"Unsupported Takeout product {value!r}. Supported aliases: {supported}")
+
+def parse_takeout_products(value) -> list[str]:
+    if value is None:
+        raw = list(DEFAULT_TAKEOUT_PRODUCTS)
+    elif isinstance(value, str):
+        raw = [part.strip() for part in re.split(r"[,;]", value) if part.strip()]
+    else:
+        raw = [str(part).strip() for part in value if str(part).strip()]
+
+    products = []
+    seen = set()
+    for item in raw:
+        product = normalize_takeout_product(item)
+        if product not in seen:
+            products.append(product)
+            seen.add(product)
+
+    if not products:
+        raise SystemExit("At least one Takeout product is required")
+    return products
+
+def takeout_products_text(products: list[str]) -> str:
+    return ", ".join(products)
+
+def takeout_create_export_js(products: list[str]) -> str:
+    return TAKEOUT_CREATE_EXPORT_JS.replace("__AUTOTAKEOUT_PRODUCTS__", json.dumps(products))
+
 TAKEOUT_CREATE_EXPORT_JS = r"""
 (async () => {
   const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
   const norm = (s) => (s || '').replace(/\s+/g, ' ').trim();
+  const productNames = __AUTOTAKEOUT_PRODUCTS__;
   const visible = (el) => !!(el && (el.offsetWidth || el.offsetHeight || el.getClientRects().length));
   const textOf = (el) => norm([
     el.innerText,
@@ -113,6 +162,21 @@ TAKEOUT_CREATE_EXPORT_JS = r"""
     el.click();
     await sleep(1200);
     return true;
+  };
+  const scrollMore = async () => {
+    let changed = false;
+    const amount = Math.max(500, Math.floor(window.innerHeight * 0.85));
+    const beforeWindow = window.scrollY;
+    window.scrollBy(0, amount);
+    changed = changed || window.scrollY !== beforeWindow;
+    for (const el of Array.from(document.querySelectorAll('*')).filter(visible)) {
+      if (el.scrollHeight <= el.clientHeight + 20) continue;
+      const before = el.scrollTop;
+      el.scrollTop = before + amount;
+      changed = changed || el.scrollTop !== before;
+    }
+    await sleep(500);
+    return changed;
   };
   const clickControl = async (regex, label) => {
     for (const el of controls()) {
@@ -137,10 +201,26 @@ TAKEOUT_CREATE_EXPORT_JS = r"""
     if (el.matches && el.matches('input[type="checkbox"]')) return !!el.checked;
     return el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-checked') === 'true';
   };
-  const setGooglePhotosChecked = async () => {
-    const labels = Array.from(document.querySelectorAll('div,span,label'))
+  const productMatches = (text, productName) => {
+    if (!text) return false;
+    const lowText = text.toLowerCase();
+    const lowProduct = productName.toLowerCase();
+    return lowText === lowProduct || lowText.startsWith(`${lowProduct} `) || lowText.includes(lowProduct);
+  };
+  const productLabels = (productName) => {
+    const lowProduct = productName.toLowerCase();
+    const all = Array.from(document.querySelectorAll('div,span,label'))
       .filter(visible)
-      .filter((el) => /Google Photos/i.test(textOf(el)));
+      .map((el) => ({el, text: textOf(el)}))
+      .filter(({text}) => productMatches(text, productName));
+    const exact = all.filter(({text}) => text.toLowerCase() === lowProduct);
+    if (exact.length) return exact.map(({el}) => el);
+    const prefix = all.filter(({text}) => text.toLowerCase().startsWith(`${lowProduct} `) && text.length <= productName.length + 80);
+    if (prefix.length) return prefix.map(({el}) => el);
+    return all.filter(({text}) => text.length <= productName.length + 120).map(({el}) => el);
+  };
+  const setProductChecked = async (productName) => {
+    const labels = productLabels(productName);
     for (const label of labels) {
       let parent = label;
       for (let i = 0; i < 9 && parent; i++, parent = parent.parentElement) {
@@ -152,6 +232,26 @@ TAKEOUT_CREATE_EXPORT_JS = r"""
       }
     }
     return false;
+  };
+  const setProductCheckedByScrolling = async (productName) => {
+    window.scrollTo(0, 0);
+    await sleep(500);
+    for (let i = 0; i < 80; i++) {
+      if (await setProductChecked(productName)) return true;
+      if (!(await scrollMore())) break;
+    }
+    return false;
+  };
+  const selectProducts = async () => {
+    const missing = [];
+    for (const productName of productNames) {
+      try {
+        await waitFor(() => setProductCheckedByScrolling(productName), `${productName} checkbox`, 60000);
+      } catch (e) {
+        missing.push(productName);
+      }
+    }
+    return missing;
   };
   const choose = async (current, desired, label) => {
     if (await clickControl(desired, label)) return true;
@@ -167,8 +267,13 @@ TAKEOUT_CREATE_EXPORT_JS = r"""
       return {ok: false, step: 'deselect all', detail: 'Could not find the Deselect all control.'};
     }
 
-    if (!(await waitFor(setGooglePhotosChecked, 'Google Photos checkbox'))) {
-      return {ok: false, step: 'select Google Photos', detail: 'Could not find the Google Photos checkbox.'};
+    const missingProducts = await selectProducts();
+    if (missingProducts.length) {
+      return {
+        ok: false,
+        step: 'select products',
+        detail: `Could not find or select product checkbox(es): ${missingProducts.join(', ')}`,
+      };
     }
 
     if (!(await waitFor(() => clickControl(/Next step/i, 'Next step'), 'Next step button'))) {
@@ -1181,25 +1286,31 @@ def browser_profile_ready(profile: Path, browser: Path | None) -> bool:
 def clear_pending_takeout_export() -> None:
     PENDING_EXPORT.unlink(missing_ok=True)
 
-def open_takeout(profile: Path, browser: Path | None) -> None:
+def open_takeout(profile: Path, browser: Path | None, products: list[str]) -> None:
     proc = launch_browser(profile, browser, "https://takeout.google.com/?pli=1")
-    input("Create the Google Photos Takeout export in the normal browser window, then close it and press Enter here. ")
+    input(
+        "Create the Takeout export for "
+        f"{takeout_products_text(products)} in the normal browser window, then close it and press Enter here. "
+    )
     stop_browser(proc)
 
-def create_takeout_export(profile: Path, browser: Path | None) -> None:
-    print("Automating Takeout: deselect all, select Google Photos, choose .tgz and 50 GB, create export.")
+def create_takeout_export(profile: Path, browser: Path | None, products: list[str]) -> None:
+    print(
+        "Automating Takeout: deselect all, select "
+        f"{takeout_products_text(products)}, choose .tgz and 50 GB, create export."
+    )
     try:
         proc, ws = open_browser_with_devtools(profile, browser, "https://takeout.google.com/?pli=1")
         try:
             ws.settimeout(180)
-            result = cdp_eval(ws, TAKEOUT_CREATE_EXPORT_JS, await_promise=True)
+            result = cdp_eval(ws, takeout_create_export_js(products), await_promise=True)
         finally:
             ws.close()
             stop_browser(proc)
     except Exception as e:
         print(f"Takeout automation failed: {e}")
         print("Opening Takeout for manual fallback.")
-        open_takeout(profile, browser)
+        open_takeout(profile, browser, products)
         return
 
     if not result.get("ok"):
@@ -1207,16 +1318,26 @@ def create_takeout_export(profile: Path, browser: Path | None) -> None:
         if result.get("detail"):
             print(result["detail"])
         print("Opening Takeout for manual fallback.")
-        open_takeout(profile, browser)
+        open_takeout(profile, browser, products)
         return
 
     print("Takeout export request created.")
 
-def pending_takeout_export_active() -> bool:
+def pending_takeout_export_active(products: list[str]) -> bool:
     try:
         data = json.loads(PENDING_EXPORT.read_text(encoding="utf-8"))
         requested_at = float(data.get("requested_at_unix") or 0)
     except (FileNotFoundError, json.JSONDecodeError, OSError, TypeError, ValueError):
+        return False
+
+    pending_products = data.get("products")
+    if pending_products is None and data.get("product"):
+        pending_products = [data["product"]]
+    try:
+        pending = parse_takeout_products(pending_products)
+    except SystemExit:
+        return False
+    if pending != products:
         return False
 
     age = time.time() - requested_at
@@ -2652,12 +2773,12 @@ def wait_for_takeout_links(
         time.sleep(sleep_for)
         attempt += 1
 
-def write_pending_takeout_export() -> None:
+def write_pending_takeout_export(products: list[str]) -> None:
     PENDING_EXPORT.parent.mkdir(parents=True, exist_ok=True)
     PENDING_EXPORT.write_text(
         json.dumps(
             {
-                "product": "Google Photos",
+                "products": products,
                 "requested_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
                 "requested_at_unix": time.time(),
             },
@@ -2671,6 +2792,7 @@ def write_pending_takeout_export() -> None:
 
 def guided(a: argparse.Namespace) -> None:
     print(f"state: {STATE}")
+    print(f"takeout products: {takeout_products_text(a.products)}")
     print(f"raw archives: {a.raw}")
     print(f"merged output: {a.merged}")
     print("")
@@ -2696,16 +2818,16 @@ def guided(a: argparse.Namespace) -> None:
     if not found:
         print("No ready Takeout email found.")
         if a.create_export:
-            if pending_takeout_export_active():
+            if pending_takeout_export_active(a.products):
                 print("Takeout export was already requested; waiting on Gmail instead of creating another one.")
             else:
-                print("Creating a Google Photos Takeout export automatically.")
-                create_takeout_export(profile=a.profile, browser=a.browser)
-                write_pending_takeout_export()
+                print(f"Creating a Takeout export for {takeout_products_text(a.products)} automatically.")
+                create_takeout_export(profile=a.profile, browser=a.browser, products=a.products)
+                write_pending_takeout_export(a.products)
         else:
             print("Opening Takeout for manual export creation.")
-            open_takeout(profile=a.profile, browser=a.browser)
-            write_pending_takeout_export()
+            open_takeout(profile=a.profile, browser=a.browser, products=a.products)
+            write_pending_takeout_export(a.products)
         found = wait_for_takeout_links(
             service,
             query=a.query,
@@ -2869,6 +2991,7 @@ def resolve_preferences(
     browser: bool = False,
     raw: bool = False,
     merged: bool = False,
+    products: bool = False,
     restic: bool = False,
     save: bool = True,
 ) -> None:
@@ -2918,6 +3041,20 @@ def resolve_preferences(
         config["merged"] = str(a.merged)
         changed = True
 
+    if products:
+        value = getattr(a, "products", None)
+        if value is None:
+            value = config.get("products") or list(DEFAULT_TAKEOUT_PRODUCTS)
+            if (
+                parse_takeout_products(value) == list(LEGACY_DEFAULT_TAKEOUT_PRODUCTS)
+                and config.get("products_version") != TAKEOUT_PRODUCTS_CONFIG_VERSION
+            ):
+                value = list(DEFAULT_TAKEOUT_PRODUCTS)
+        a.products = parse_takeout_products(value)
+        config["products"] = a.products
+        config["products_version"] = TAKEOUT_PRODUCTS_CONFIG_VERSION
+        changed = True
+
     if restic:
         explicit_bucket = getattr(a, "b2_bucket", None)
         if getattr(a, "restic_repo", None) is None and explicit_bucket is None:
@@ -2952,7 +3089,11 @@ def main() -> None:
         "--create-export",
         action=argparse.BooleanOptionalAction,
         default=True,
-        help="Automatically create the Google Photos Takeout export if no ready email exists.",
+        help="Automatically create the configured Takeout export if no ready email exists.",
+    )
+    p.add_argument(
+        "--products",
+        help="Comma-separated Takeout products to export; defaults to photos,gmail,drive.",
     )
     p.add_argument("--skip-extract", action="store_true")
     p.add_argument("--downloader", choices=["auto", "browser", "aria2c", "curl"], default="auto")
@@ -3008,6 +3149,10 @@ def main() -> None:
     run.add_argument("--merged", type=Path)
     run.add_argument("--query", default=TAKEOUT_QUERY)
     run.add_argument("--max-emails", type=int, default=50)
+    run.add_argument(
+        "--products",
+        help="Comma-separated Takeout products to export; defaults to photos,gmail,drive.",
+    )
     run.add_argument("--skip-extract", action="store_true")
     run.add_argument("--downloader", choices=["auto", "browser", "aria2c", "curl"], default="auto")
     run.add_argument("--google-password")
@@ -3164,7 +3309,7 @@ def main() -> None:
     STATE.mkdir(parents=True, exist_ok=True)
 
     if a.cmd is None:
-        resolve_preferences(a, credentials=True, browser=True, raw=True, merged=True, restic=a.restic)
+        resolve_preferences(a, credentials=True, browser=True, raw=True, merged=True, products=True, restic=a.restic)
         guided(a)
     elif a.cmd == "login":
         resolve_preferences(a, credentials=bool(a.credentials), browser=True)
@@ -3189,7 +3334,7 @@ def main() -> None:
         resolve_preferences(a, raw=True, merged=True, save=False)
         extract_all(a.raw, a.merged)
     elif a.cmd == "run":
-        resolve_preferences(a, credentials=True, browser=True, raw=True, merged=True, restic=a.restic)
+        resolve_preferences(a, credentials=True, browser=True, raw=True, merged=True, products=True, restic=a.restic)
         restic_plan = setup_restic(a) if a.restic else None
         found = find_takeout_links(a.credentials, a.token, a.query, a.max_emails)
         save_links(found)
