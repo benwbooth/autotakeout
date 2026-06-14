@@ -48,6 +48,7 @@ from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
+from googleapiclient.errors import HttpError
 from websocket import WebSocketTimeoutException, create_connection
 
 BACKREST_DOCKER_IMAGE = "garethgeorge/backrest"
@@ -1229,6 +1230,20 @@ def find_takeout_links_from_service(service, query: str, max_emails: int) -> dic
                 "links": links,
             }
     return best
+
+def retryable_gmail_error(exc: BaseException) -> bool:
+    if isinstance(exc, (OSError, TimeoutError)):
+        return True
+    if isinstance(exc, HttpError):
+        status = getattr(exc.resp, "status", None)
+        return status in (429, 500, 502, 503, 504)
+    return False
+
+def gmail_error_summary(exc: BaseException) -> str:
+    text = str(exc).replace("\n", " ").strip()
+    if len(text) > 300:
+        text = text[:297] + "..."
+    return f"{type(exc).__name__}: {text}"
 
 def gmail_service(credentials: Path, token: Path):
     creds = None
@@ -2765,9 +2780,17 @@ def wait_for_takeout_links(
     timeout_seconds: int,
 ) -> dict:
     started = time.monotonic()
-    attempt = 1
+    announced_waiting = False
     while True:
-        found = find_takeout_links_from_service(service, query, max_emails)
+        check_failed = False
+        try:
+            found = find_takeout_links_from_service(service, query, max_emails)
+        except BaseException as e:
+            if isinstance(e, KeyboardInterrupt) or not retryable_gmail_error(e):
+                raise
+            print(f"Gmail check failed; will retry: {gmail_error_summary(e)}")
+            check_failed = True
+            found = None
         if found:
             return found
 
@@ -2775,16 +2798,16 @@ def wait_for_takeout_links(
         if timeout_seconds and elapsed >= timeout_seconds:
             raise SystemExit(f"No Takeout email with download links after {elapsed} seconds")
 
-        if attempt == 1:
+        if not announced_waiting and not check_failed:
             print("No Takeout download email yet.")
-            print("If you have not created the export yet, create it at https://takeout.google.com/ now.")
+            print("If no export is currently pending, create one at https://takeout.google.com/ now.")
+            announced_waiting = True
 
         sleep_for = poll_seconds
         if timeout_seconds:
             sleep_for = min(sleep_for, max(1, timeout_seconds - elapsed))
         print(f"Waiting {sleep_for}s before checking Gmail again...")
         time.sleep(sleep_for)
-        attempt += 1
 
 def write_pending_takeout_export(products: list[str]) -> None:
     PENDING_EXPORT.parent.mkdir(parents=True, exist_ok=True)
