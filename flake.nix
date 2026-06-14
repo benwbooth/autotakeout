@@ -6,7 +6,7 @@
   };
 
   outputs =
-    { nixpkgs, ... }:
+    inputs@{ nixpkgs, ... }:
     let
       systems = [
         "x86_64-linux"
@@ -15,6 +15,9 @@
         "aarch64-darwin"
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
+      inputPaths =
+        builtins.concatStringsSep " "
+          (map (input: input.outPath) (builtins.attrValues (builtins.removeAttrs inputs [ "self" ])));
     in
     {
       devShells = forAllSystems (
@@ -24,6 +27,8 @@
         in
         {
           default = pkgs.mkShell {
+            NIX_INPUTS = inputPaths;
+
             packages =
               with pkgs;
               [
