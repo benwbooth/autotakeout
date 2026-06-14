@@ -43,6 +43,7 @@ from urllib.parse import parse_qs, quote, urlsplit
 from urllib.request import Request, urlopen
 
 from bs4 import BeautifulSoup
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request as GoogleAuthRequest
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -1230,11 +1231,23 @@ def find_takeout_links_from_service(service, query: str, max_emails: int) -> dic
     return best
 
 def gmail_service(credentials: Path, token: Path):
-    creds = Credentials.from_authorized_user_file(token, SCOPES) if token.exists() else None
+    creds = None
+    if token.exists():
+        try:
+            creds = Credentials.from_authorized_user_file(token, SCOPES)
+        except ValueError:
+            print(f"Cached Gmail OAuth token is invalid; recreating it: {token}")
+            token.unlink(missing_ok=True)
+
     if not creds or not creds.valid:
         if creds and creds.expired and creds.refresh_token:
-            creds.refresh(GoogleAuthRequest())
-        else:
+            try:
+                creds.refresh(GoogleAuthRequest())
+            except RefreshError as e:
+                print(f"Cached Gmail OAuth token refresh failed; recreating it: {e}")
+                token.unlink(missing_ok=True)
+                creds = None
+        if not creds or not creds.valid:
             creds = InstalledAppFlow.from_client_secrets_file(str(credentials), SCOPES).run_local_server(port=0)
         token.parent.mkdir(parents=True, exist_ok=True)
         token.write_text(creds.to_json())
