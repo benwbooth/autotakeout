@@ -73,6 +73,10 @@ TAKEOUT_QUERY = (
     '("Google data is ready to download" OR "Your Google data is ready" '
     'OR "Your Google Takeout export is ready" OR "Takeout") newer_than:8d'
 )
+TAKEOUT_REQUEST_QUERY = (
+    'from:no-reply@accounts.google.com ("Archive of Google data requested" OR "Google data archive requested" '
+    'OR "Google Takeout export requested") newer_than:8d'
+)
 UA = "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/125 Safari/537.36"
 URL_RE = re.compile(r"https?://[^\s\"'<>]+")
 STATE = Path(os.environ.get("XDG_STATE_HOME", Path.home() / ".local/state")) / "autotakeout"
@@ -1231,6 +1235,23 @@ def find_takeout_links_from_service(service, query: str, max_emails: int) -> dic
             }
     return best
 
+def find_takeout_request_from_service(service, query: str, max_emails: int) -> dict | None:
+    res = service.users().messages().list(userId="me", q=query, maxResults=max_emails).execute()
+    messages = res.get("messages", [])
+    if not messages:
+        return None
+
+    best = None
+    for msg in messages:
+        full = service.users().messages().get(userId="me", id=msg["id"], format="metadata").execute()
+        if best is None or int(full["internalDate"]) > int(best["internalDate"]):
+            best = {
+                "id": full["id"],
+                "internalDate": full["internalDate"],
+                "headers": headers(full.get("payload", {})),
+            }
+    return best
+
 def retryable_gmail_error(exc: BaseException) -> bool:
     if isinstance(exc, (OSError, TimeoutError)):
         return True
@@ -1244,6 +1265,15 @@ def gmail_error_summary(exc: BaseException) -> str:
     if len(text) > 300:
         text = text[:297] + "..."
     return f"{type(exc).__name__}: {text}"
+
+def try_gmail_check(label: str, func):
+    try:
+        return func(), False
+    except BaseException as e:
+        if isinstance(e, KeyboardInterrupt) or not retryable_gmail_error(e):
+            raise
+        print(f"{label} failed; will not create a new export yet: {gmail_error_summary(e)}")
+        return None, True
 
 def gmail_service(credentials: Path, token: Path):
     creds = None
@@ -1478,6 +1508,12 @@ def print_links(found: dict, show: bool) -> None:
     print(f"date: {h.get('date', '')}")
     for i, item in enumerate(found["links"], 1):
         print(f"{i}: {item['url'] if show else redact(item['url'])}")
+
+def print_takeout_request(found: dict) -> None:
+    h = found["headers"]
+    print(f"matched pending request: {h.get('subject', '')}")
+    print(f"from: {h.get('from', '')}")
+    print(f"date: {h.get('date', '')}")
 
 def is_archive_download_url(url: str) -> bool:
     low = url.lower()
@@ -2850,12 +2886,24 @@ def guided(a: argparse.Namespace) -> None:
         print("Browser profile looks logged in.")
 
     print("3. Looking for Takeout email.")
-    found = find_takeout_links_from_service(service, a.query, a.max_emails)
+    found, gmail_uncertain = try_gmail_check(
+        "Takeout download email check",
+        lambda: find_takeout_links_from_service(service, a.query, a.max_emails),
+    )
     if not found:
         print("No ready Takeout email found.")
         if a.create_export:
-            if pending_takeout_export_active(a.products):
-                print("Takeout export was already requested; waiting on Gmail instead of creating another one.")
+            request, request_uncertain = try_gmail_check(
+                "Takeout request confirmation email check",
+                lambda: find_takeout_request_from_service(service, TAKEOUT_REQUEST_QUERY, a.max_emails),
+            )
+            if request:
+                print("Found a recent Takeout request confirmation email; waiting instead of creating another export.")
+                print_takeout_request(request)
+            elif gmail_uncertain or request_uncertain:
+                print("Gmail state is uncertain; waiting instead of creating another export.")
+            elif pending_takeout_export_active(a.products):
+                print("Local pending export marker is active; waiting on Gmail instead of creating another export.")
             else:
                 print(f"Creating a Takeout export for {takeout_products_text(a.products)} automatically.")
                 create_takeout_export(profile=a.profile, browser=a.browser, products=a.products)
