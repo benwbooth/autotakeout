@@ -207,37 +207,67 @@ TAKEOUT_CREATE_EXPORT_JS = r"""
     if (el.matches && el.matches('input[type="checkbox"]')) return !!el.checked;
     return el.getAttribute('aria-checked') === 'true' || el.getAttribute('data-checked') === 'true';
   };
-  const productMatches = (text, productName) => {
+  const checkboxes = () => Array.from(
+    document.querySelectorAll('[role="checkbox"],input[type="checkbox"]')
+  ).filter(visible);
+  // The product "row" for a checkbox is the nearest ancestor that still
+  // contains only this one checkbox. Going any higher would merge in sibling
+  // products, so its text (name + description) belongs to this product alone.
+  const rowFor = (box) => {
+    let row = box;
+    let parent = box.parentElement;
+    for (let i = 0; i < 12 && parent; i++, parent = parent.parentElement) {
+      if (parent.querySelectorAll('[role="checkbox"],input[type="checkbox"]').length !== 1) break;
+      row = parent;
+    }
+    return row;
+  };
+  const ariaLabel = (box) => {
+    const aria = norm(box.getAttribute && box.getAttribute('aria-label'));
+    if (aria) return aria;
+    const labelledby = box.getAttribute && box.getAttribute('aria-labelledby');
+    if (labelledby) {
+      return norm(labelledby.split(/\s+/)
+        .map((id) => document.getElementById(id))
+        .filter(Boolean)
+        .map((el) => textOf(el))
+        .join(' '));
+    }
+    return '';
+  };
+  const escapeRegex = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  // Whole-word match: the product name must sit at a word boundary, so "Mail"
+  // is found inside "mail_icon Mail, not selected" but not inside "Gmail" or
+  // "email", and leading icon-ligature text / trailing state text don't break it.
+  const hasWord = (text, lowProduct) => {
     if (!text) return false;
-    const lowText = text.toLowerCase();
-    const lowProduct = productName.toLowerCase();
-    return lowText === lowProduct || lowText.startsWith(`${lowProduct} `) || lowText.includes(lowProduct);
+    return new RegExp(`(^|[^a-z0-9])${escapeRegex(lowProduct)}([^a-z0-9]|$)`).test(text.toLowerCase());
   };
-  const productLabels = (productName) => {
-    const lowProduct = productName.toLowerCase();
-    const all = Array.from(document.querySelectorAll('div,span,label'))
-      .filter(visible)
-      .map((el) => ({el, text: textOf(el)}))
-      .filter(({text}) => productMatches(text, productName));
-    const exact = all.filter(({text}) => text.toLowerCase() === lowProduct);
-    if (exact.length) return exact.map(({el}) => el);
-    const prefix = all.filter(({text}) => text.toLowerCase().startsWith(`${lowProduct} `) && text.length <= productName.length + 80);
-    if (prefix.length) return prefix.map(({el}) => el);
-    return all.filter(({text}) => text.length <= productName.length + 120).map(({el}) => el);
-  };
+  // Find this product's own checkbox. Each checkbox is scoped to its single
+  // product row (rowFor), so we only ever match within one product. Prefer a
+  // hit in the aria-label or the row heading over one buried in a description,
+  // which keeps unrelated rows (e.g. "Access Log Activity") from being selected.
   const setProductChecked = async (productName) => {
-    const labels = productLabels(productName);
-    for (const label of labels) {
-      let parent = label;
-      for (let i = 0; i < 9 && parent; i++, parent = parent.parentElement) {
-        const box = Array.from(parent.querySelectorAll('[role="checkbox"],input[type="checkbox"]')).filter(visible)[0];
-        if (box) {
-          if (!checked(box)) await click(box);
-          return true;
-        }
+    const lowProduct = productName.toLowerCase();
+    let best = null;
+    let bestScore = 0;
+    for (const box of checkboxes()) {
+      const aria = ariaLabel(box);
+      const rowText = textOf(rowFor(box));
+      const heading = rowText.slice(0, lowProduct.length + 40);
+      let score = 0;
+      if (aria.toLowerCase() === lowProduct) score = 4;
+      else if (hasWord(aria, lowProduct)) score = 3;
+      else if (hasWord(heading, lowProduct)) score = 2;
+      else if (hasWord(rowText, lowProduct)) score = 1;
+      if (score > bestScore) {
+        bestScore = score;
+        best = box;
       }
     }
-    return false;
+    if (!best) return false;
+    if (!checked(best)) await click(best);
+    return true;
   };
   const setProductCheckedByScrolling = async (productName) => {
     window.scrollTo(0, 0);
@@ -1216,7 +1246,7 @@ def extract_links(payload: dict) -> list[dict]:
 def headers(payload: dict) -> dict:
     return {h.get("name", "").lower(): h.get("value", "") for h in payload.get("headers", [])}
 
-def find_takeout_links_from_service(service, query: str, max_emails: int) -> dict | None:
+def find_takeout_links_from_service(service, query: str, max_emails: int, after_ms: int = 0) -> dict | None:
     res = service.users().messages().list(userId="me", q=query, maxResults=max_emails).execute()
     messages = res.get("messages", [])
     if not messages:
@@ -1225,6 +1255,8 @@ def find_takeout_links_from_service(service, query: str, max_emails: int) -> dic
     best = None
     for msg in messages:
         full = service.users().messages().get(userId="me", id=msg["id"], format="full").execute()
+        if after_ms and int(full["internalDate"]) <= after_ms:
+            continue
         links = extract_links(full.get("payload", {}))
         if links and (best is None or int(full["internalDate"]) > int(best["internalDate"])):
             best = {
@@ -2814,13 +2846,14 @@ def wait_for_takeout_links(
     max_emails: int,
     poll_seconds: int,
     timeout_seconds: int,
+    after_ms: int = 0,
 ) -> dict:
     started = time.monotonic()
     announced_waiting = False
     while True:
         check_failed = False
         try:
-            found = find_takeout_links_from_service(service, query, max_emails)
+            found = find_takeout_links_from_service(service, query, max_emails, after_ms=after_ms)
         except BaseException as e:
             if isinstance(e, KeyboardInterrupt) or not retryable_gmail_error(e):
                 raise
@@ -2886,38 +2919,57 @@ def guided(a: argparse.Namespace) -> None:
         print("Browser profile looks logged in.")
 
     print("3. Looking for Takeout email.")
-    found, gmail_uncertain = try_gmail_check(
-        "Takeout download email check",
-        lambda: find_takeout_links_from_service(service, a.query, a.max_emails),
-    )
-    if not found:
-        print("No ready Takeout email found.")
+    after_ms = 0
+    found = None
+    if a.new_export:
+        # Force a brand-new export and ignore any earlier Takeout email (e.g. a
+        # previous run that selected the wrong products). Capture a cutoff now so
+        # only a "ready" email that arrives after this point is accepted.
+        after_ms = int(time.time() * 1000)
+        clear_pending_takeout_export()
+        print("--new-export set; ignoring any earlier Takeout email and creating a fresh export.")
         if a.create_export:
-            request, request_uncertain = try_gmail_check(
-                "Takeout request confirmation email check",
-                lambda: find_takeout_request_from_service(service, TAKEOUT_REQUEST_QUERY, a.max_emails),
-            )
-            if request:
-                print("Found a recent Takeout request confirmation email; waiting instead of creating another export.")
-                print_takeout_request(request)
-            elif gmail_uncertain or request_uncertain:
-                print("Gmail state is uncertain; waiting instead of creating another export.")
-            elif pending_takeout_export_active(a.products):
-                print("Local pending export marker is active; waiting on Gmail instead of creating another export.")
-            else:
-                print(f"Creating a Takeout export for {takeout_products_text(a.products)} automatically.")
-                create_takeout_export(profile=a.profile, browser=a.browser, products=a.products)
-                write_pending_takeout_export(a.products)
+            print(f"Creating a Takeout export for {takeout_products_text(a.products)} automatically.")
+            create_takeout_export(profile=a.profile, browser=a.browser, products=a.products)
         else:
             print("Opening Takeout for manual export creation.")
             open_takeout(profile=a.profile, browser=a.browser, products=a.products)
-            write_pending_takeout_export(a.products)
+        write_pending_takeout_export(a.products)
+    else:
+        found, gmail_uncertain = try_gmail_check(
+            "Takeout download email check",
+            lambda: find_takeout_links_from_service(service, a.query, a.max_emails),
+        )
+        if not found:
+            print("No ready Takeout email found.")
+            if a.create_export:
+                request, request_uncertain = try_gmail_check(
+                    "Takeout request confirmation email check",
+                    lambda: find_takeout_request_from_service(service, TAKEOUT_REQUEST_QUERY, a.max_emails),
+                )
+                if request:
+                    print("Found a recent Takeout request confirmation email; waiting instead of creating another export.")
+                    print_takeout_request(request)
+                elif gmail_uncertain or request_uncertain:
+                    print("Gmail state is uncertain; waiting instead of creating another export.")
+                elif pending_takeout_export_active(a.products):
+                    print("Local pending export marker is active; waiting on Gmail instead of creating another export.")
+                else:
+                    print(f"Creating a Takeout export for {takeout_products_text(a.products)} automatically.")
+                    create_takeout_export(profile=a.profile, browser=a.browser, products=a.products)
+                    write_pending_takeout_export(a.products)
+            else:
+                print("Opening Takeout for manual export creation.")
+                open_takeout(profile=a.profile, browser=a.browser, products=a.products)
+                write_pending_takeout_export(a.products)
+    if not found:
         found = wait_for_takeout_links(
             service,
             query=a.query,
             max_emails=a.max_emails,
             poll_seconds=a.poll,
             timeout_seconds=a.timeout,
+            after_ms=after_ms,
         )
     clear_pending_takeout_export()
     save_links(found)
@@ -3174,6 +3226,11 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Automatically create the configured Takeout export if no ready email exists.",
+    )
+    p.add_argument(
+        "--new-export",
+        action="store_true",
+        help="Force a brand-new export, ignoring any earlier Takeout email (use when a previous run exported the wrong products).",
     )
     p.add_argument(
         "--products",
