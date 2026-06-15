@@ -894,6 +894,20 @@ def google_password_prompt_visible(ws) -> bool:
     except Exception:
         return False
 
+def google_password_rejected(ws) -> bool:
+    expression = """
+(() => {
+  const text = (document.body && document.body.innerText || '').toLowerCase();
+  return text.includes('wrong password')
+    || text.includes('incorrect password')
+    || text.includes("password you entered");
+})()
+"""
+    try:
+        return bool(cdp_eval(ws, expression, timeout=5))
+    except Exception:
+        return False
+
 def print_download_progress(name: str, params: dict, previous_width: int, *, final: bool = False) -> int:
     received = int(params.get("receivedBytes") or 0)
     total_bytes = int(params.get("totalBytes") or 0)
@@ -957,7 +971,6 @@ def wait_for_browser_download(
     last_progress_width = 0
     waiting_for_auth = False
     password_submitted = False
-    password_prompted = False
     while True:
         try:
             event = cdp_next_event(ws)
@@ -968,13 +981,18 @@ def wait_for_browser_download(
             current_url = str(detail.get("url", ""))
             if "accounts.google.com/" in current_url:
                 password = creds.get("password")
+                # If we already submitted a password and Google rejected it,
+                # forget it and prompt again instead of resubmitting the bad one.
+                if password_submitted and google_password_rejected(ws):
+                    print("Google rejected the password; please re-enter it.")
+                    creds["password"] = password = None
+                    password_submitted = False
                 if password and not password_submitted and submit_google_password(ws, password):
                     print("Submitted Google password challenge.")
                     password_submitted = True
                     waiting_for_auth = True
                     continue
-                if not password and not password_prompted and google_password_prompt_visible(ws):
-                    password_prompted = True
+                if not password and google_password_prompt_visible(ws):
                     password = getpass.getpass("Google password for Takeout reauth (not stored): ")
                     # Keep it in memory for the rest of the run so later parts and
                     # retries reuse it instead of prompting again. Never persisted.
