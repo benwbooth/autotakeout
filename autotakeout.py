@@ -6,6 +6,7 @@
 #   ./autotakeout.py --poll 300 --timeout 0
 #   ./autotakeout.py --b2-bucket my-unique-bucket-name
 #   ./autotakeout.py snapshots
+#   ./autotakeout.py prune --dry-run        # preview; drop --dry-run to keep only the latest snapshot
 #   ./autotakeout.py verify
 #   ./autotakeout.py mount
 #   ./autotakeout.py backrest
@@ -1861,6 +1862,49 @@ def list_restic_snapshots(a: argparse.Namespace) -> None:
     else:
         print_restic_snapshots(snapshots)
 
+def prune_restic_snapshots(a: argparse.Namespace) -> None:
+    plan = setup_restic(a, initialize=False, save=False)
+    tag = None if a.all else "autotakeout"
+    path_filter = a.path.expanduser().resolve() if a.path else None
+    snapshots = restic_snapshots(plan, path_filter=path_filter, tag=tag)
+    if not snapshots:
+        print("No matching restic snapshots found; nothing to prune.")
+        return
+
+    keep = max(1, a.keep_last)
+    print(f"Current snapshots ({len(snapshots)}):")
+    print_restic_snapshots(snapshots)
+    forgetting = max(0, len(snapshots) - keep)
+    print(
+        f"\nKeeping the {keep} most recent snapshot(s); "
+        f"{forgetting} older snapshot(s) would be forgotten and their unique data pruned from the repo."
+    )
+
+    # Group by host only so differing path sets across old snapshots don't split
+    # them into separate groups (which would each retain their own latest).
+    command = restic_base_command(plan) + ["forget", "--group-by", "host", "--keep-last", str(keep)]
+    if tag:
+        command += ["--tag", tag]
+    if path_filter is not None:
+        command += ["--path", str(path_filter)]
+    if a.dry_run:
+        command += ["--dry-run"]
+        print("Dry run: no changes will be made.")
+    else:
+        command += ["--prune"]
+        if not a.yes and not prompt_yes_no(
+            "This permanently removes the older snapshots and their data from the backup. Continue?",
+            default=False,
+        ):
+            print("Aborted.")
+            return
+
+    subprocess.run(command, env=plan["env"], check=True)
+
+    if not a.dry_run:
+        print("\nRemaining snapshots:")
+        print_restic_snapshots(restic_snapshots(plan, path_filter=path_filter, tag=tag))
+
 def select_restic_snapshot(plan: dict, snapshot: str | None, *, path_filter: Path | None = None) -> dict:
     snapshots = restic_snapshots(plan, path_filter=path_filter)
     if not snapshots and path_filter is not None:
@@ -3535,6 +3579,19 @@ def main() -> None:
     snapshots.add_argument("--all", action="store_true", help="List all snapshots, not just autotakeout-tagged snapshots")
     snapshots.add_argument("--json", action="store_true", help="Print raw restic snapshots JSON")
 
+    prune = sub.add_parser("prune", help="Keep only the latest snapshot(s) and reclaim space (restic forget --prune)")
+    prune.add_argument("--restic-repo")
+    prune.add_argument("--restic-password-file", type=Path)
+    prune.add_argument("--b2-bucket", help="Backblaze B2 bucket used for restic")
+    prune.add_argument("--b2-prefix", help="Path inside the B2 bucket for the restic repo")
+    prune.add_argument("--b2-key-id")
+    prune.add_argument("--b2-key")
+    prune.add_argument("--path", type=Path, help="Only consider snapshots containing this path")
+    prune.add_argument("--keep-last", type=int, default=1, help="Number of most recent snapshots to keep (default 1)")
+    prune.add_argument("--all", action="store_true", help="Consider all snapshots, not just autotakeout-tagged ones")
+    prune.add_argument("--dry-run", action="store_true", help="Show what would be removed without changing anything")
+    prune.add_argument("--yes", action="store_true", help="Do not prompt for confirmation")
+
     verify = sub.add_parser("verify", help="Verify the restic backup")
     verify.add_argument("--raw", type=Path)
     verify.add_argument("--merged", type=Path)
@@ -3660,6 +3717,9 @@ def main() -> None:
     elif a.cmd == "snapshots":
         resolve_preferences(a, restic=True, save=False)
         list_restic_snapshots(a)
+    elif a.cmd == "prune":
+        resolve_preferences(a, restic=True, save=False)
+        prune_restic_snapshots(a)
     elif a.cmd == "verify":
         resolve_preferences(a, raw=True, merged=True, restic=True, save=False)
         marker_path = first_existing_path(
