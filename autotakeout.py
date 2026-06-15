@@ -743,12 +743,21 @@ class BrowserDownloadCanceled(RuntimeError):
 def cdp_pending(ws) -> list[dict]:
     return CDP_PENDING.setdefault(id(ws), [])
 
-def cdp_call(ws, method: str, params: dict | None = None) -> dict:
+def cdp_call(ws, method: str, params: dict | None = None, *, timeout: float = 60.0) -> dict:
     cdp_call.counter += 1
     call_id = cdp_call.counter
     ws.send(json.dumps({"id": call_id, "method": method, "params": params or {}}))
+    deadline = time.monotonic() + timeout
     while True:
-        message = json.loads(ws.recv())
+        try:
+            message = json.loads(ws.recv())
+        except WebSocketTimeoutException:
+            # The socket timeout is kept short (5s) so download monitoring can
+            # poll; a command response that is briefly slow should not crash the
+            # whole run. Keep waiting until the overall deadline.
+            if time.monotonic() >= deadline:
+                raise
+            continue
         if message.get("id") != call_id:
             if "method" in message:
                 cdp_pending(ws).append(message)
@@ -826,6 +835,7 @@ def cdp_eval(ws, expression: str, *, await_promise: bool = False, timeout: int =
                     "returnByValue": True,
                     "userGesture": True,
                 },
+                timeout=max(1.0, deadline - time.monotonic()),
             )
             if "exceptionDetails" in result:
                 raise RuntimeError(result["exceptionDetails"])
@@ -934,7 +944,7 @@ def wait_for_browser_download(
     index: int,
     total: int,
     url: str,
-    google_password: str | None,
+    creds: dict,
 ) -> str | None:
     start_deadline = time.monotonic() + 120
     active_guid = ""
@@ -953,15 +963,19 @@ def wait_for_browser_download(
             detail = browser_page_summary(ws)
             current_url = str(detail.get("url", ""))
             if "accounts.google.com/" in current_url:
-                if google_password and not password_submitted and submit_google_password(ws, google_password):
+                password = creds.get("password")
+                if password and not password_submitted and submit_google_password(ws, password):
                     print("Submitted Google password challenge.")
                     password_submitted = True
                     waiting_for_auth = True
                     continue
-                if not google_password and not password_prompted and google_password_prompt_visible(ws):
+                if not password and not password_prompted and google_password_prompt_visible(ws):
                     password_prompted = True
-                    google_password = getpass.getpass("Google password for Takeout reauth (not stored): ")
-                    if google_password and submit_google_password(ws, google_password):
+                    password = getpass.getpass("Google password for Takeout reauth (not stored): ")
+                    # Keep it in memory for the rest of the run so later parts and
+                    # retries reuse it instead of prompting again. Never persisted.
+                    creds["password"] = password
+                    if password and submit_google_password(ws, password):
                         print("Submitted Google password challenge.")
                         password_submitted = True
                         waiting_for_auth = True
@@ -1048,6 +1062,7 @@ def browser_download(
 
     raw.mkdir(parents=True, exist_ok=True)
     proc, ws = open_browser_with_devtools(profile, browser, "about:blank")
+    creds = {"password": google_password}
     try:
         ws.settimeout(5)
         enable_browser_downloads(ws, raw)
@@ -1058,7 +1073,7 @@ def browser_download(
                 print(f"browser download {index}/{len(links)}{suffix}")
                 cdp_call(ws, "Page.navigate", {"url": url})
                 try:
-                    filename = wait_for_browser_download(ws, raw, index, len(links), url, google_password)
+                    filename = wait_for_browser_download(ws, raw, index, len(links), url, creds)
                     if filename and on_complete:
                         on_complete(raw / filename)
                     break
