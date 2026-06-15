@@ -49,7 +49,11 @@ from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
 from googleapiclient.discovery import build
 from googleapiclient.errors import HttpError
-from websocket import WebSocketTimeoutException, create_connection
+from websocket import (
+    WebSocketConnectionClosedException,
+    WebSocketTimeoutException,
+    create_connection,
+)
 
 BACKREST_DOCKER_IMAGE = "garethgeorge/backrest"
 BACKREST_DOCKER_TAG = "v1.13.0"
@@ -1061,18 +1065,41 @@ def browser_download(
         raise SystemExit("A Chrome/Brave/Chromium executable is required for browser downloads")
 
     raw.mkdir(parents=True, exist_ok=True)
-    proc, ws = open_browser_with_devtools(profile, browser, "about:blank")
     creds = {"password": google_password}
-    try:
+
+    # Any .crdownload present before we start is a partial from an interrupted
+    # prior run; drop it so the browser does not create a "(1)" duplicate.
+    for partial in raw.glob("*.crdownload"):
+        partial.unlink(missing_ok=True)
+
+    state = {"proc": None, "ws": None}
+
+    def connect() -> None:
+        proc, ws = open_browser_with_devtools(profile, browser, "about:blank")
         ws.settimeout(5)
         enable_browser_downloads(ws, raw)
+        state["proc"], state["ws"] = proc, ws
+
+    def disconnect() -> None:
+        if state["ws"] is not None:
+            try:
+                state["ws"].close()
+            except Exception:
+                pass
+        if state["proc"] is not None:
+            stop_browser(state["proc"])
+        state["proc"] = state["ws"] = None
+
+    connect()
+    try:
         for index, url in enumerate(links, 1):
             for attempt in range(1, BROWSER_DOWNLOAD_RETRIES + 1):
+                ws = state["ws"]
                 cdp_pending(ws).clear()
                 suffix = f" attempt {attempt}/{BROWSER_DOWNLOAD_RETRIES}" if attempt > 1 else ""
                 print(f"browser download {index}/{len(links)}{suffix}")
-                cdp_call(ws, "Page.navigate", {"url": url})
                 try:
+                    cdp_call(ws, "Page.navigate", {"url": url})
                     filename = wait_for_browser_download(ws, raw, index, len(links), url, creds)
                     if filename and on_complete:
                         on_complete(raw / filename)
@@ -1082,9 +1109,20 @@ def browser_download(
                         raise RuntimeError(str(e)) from e
                     print(f"{e}; retrying")
                     time.sleep(min(30, attempt * 5))
+                except (WebSocketConnectionClosedException, WebSocketTimeoutException, ConnectionError, OSError) as e:
+                    if attempt == BROWSER_DOWNLOAD_RETRIES:
+                        raise RuntimeError(f"Lost browser connection on item {index}/{len(links)}: {e}") from e
+                    print(f"Lost browser connection ({e}); relaunching browser and retrying")
+                    disconnect()
+                    # Drop the interrupted partial so the relaunched browser does
+                    # not create a "(1)" duplicate alongside it; completed parts
+                    # are full .tgz files and are left untouched.
+                    for partial in raw.glob("*.crdownload"):
+                        partial.unlink(missing_ok=True)
+                    time.sleep(min(30, attempt * 5))
+                    connect()
     finally:
-        ws.close()
-        stop_browser(proc)
+        disconnect()
 
 def choose_downloader(which: str, browser: Path | None) -> str:
     if which != "auto":
