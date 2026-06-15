@@ -498,7 +498,20 @@ def first_existing_path(paths: list[Path], *, default: Path) -> Path:
             return path
     return default
 
-def record_completed_download(raw: Path, filename: str, params: dict) -> None:
+def archive_download_key(url: str) -> str:
+    # A stable per-archive identity from the Takeout download URL: the export
+    # job (j) plus the archive index (i). This survives across runs even though
+    # the file may later be consumed by extraction, so we never re-navigate (and
+    # re-spend Google's per-archive download quota) just to learn it is done.
+    try:
+        query = parse_qs(urlsplit(url).query)
+    except Exception:
+        return url
+    job = (query.get("j") or [""])[0]
+    index = (query.get("i") or [""])[0]
+    return f"{job}:{index}" if job and index != "" else url
+
+def record_completed_download(raw: Path, filename: str, params: dict, url: str | None = None) -> None:
     if not filename:
         return
     path = raw / filename
@@ -514,7 +527,26 @@ def record_completed_download(raw: Path, filename: str, params: dict) -> None:
         "size": size,
         "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
     }
+    if url:
+        archives = data.setdefault("archives", {})
+        archives[archive_download_key(url)] = {"filename": filename, "size": size}
     write_private_json_if_changed(raw / RAW_DOWNLOADS_MARKER, data)
+
+def archive_download_complete(raw: Path, url: str) -> dict | None:
+    # Return the recorded completion entry for this archive URL, or None. An
+    # entry whose file is still on disk must match the recorded size; once the
+    # file has been consumed by extraction we trust the recorded completion.
+    entry = load_completed_download_marker(raw).get("archives", {}).get(archive_download_key(url))
+    if not entry:
+        return None
+    filename = entry.get("filename")
+    size = int(entry.get("size") or 0)
+    if not filename or size <= 0:
+        return None
+    path = raw / filename
+    if path.exists() and path.is_file():
+        return entry if path.stat().st_size == size else None
+    return entry
 
 def existing_download_status(raw: Path, filename: str) -> str:
     if not filename:
@@ -1031,6 +1063,9 @@ def wait_for_browser_download(
                             cdp_call(ws, "Browser.cancelDownload", {"guid": active_guid})
                         except RuntimeError:
                             pass
+                    # Record the URL->file mapping so future runs skip this
+                    # archive before navigating (and never re-spend its quota).
+                    record_completed_download(raw, filename, {"totalBytes": (raw / filename).stat().st_size}, url=url)
                     print(f"already downloaded {filename}")
                     return filename
                 if status == "invalid":
@@ -1054,7 +1089,7 @@ def wait_for_browser_download(
         state = params.get("state")
         if state == "completed":
             last_progress_width = print_download_progress(filename or active_guid, params, last_progress_width, final=True)
-            record_completed_download(raw, filename or active_guid, params)
+            record_completed_download(raw, filename or active_guid, params, url=url)
             print(f"downloaded {filename or active_guid}")
             return filename or active_guid
         if state == "canceled":
@@ -1111,6 +1146,14 @@ def browser_download(
     connect()
     try:
         for index, url in enumerate(links, 1):
+            done = archive_download_complete(raw, url)
+            if done:
+                filename = done.get("filename") or ""
+                print(f"already downloaded {filename or f'archive {index}/{len(links)}'}; skipping (no re-download)")
+                path = raw / filename if filename else None
+                if path and path.exists() and on_complete:
+                    on_complete(path)
+                continue
             for attempt in range(1, BROWSER_DOWNLOAD_RETRIES + 1):
                 ws = state["ws"]
                 cdp_pending(ws).clear()
