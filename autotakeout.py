@@ -100,11 +100,13 @@ BROWSER_DOWNLOAD_RETRIES = 5
 PENDING_EXPORT_MAX_AGE_SECONDS = 7 * 24 * 60 * 60
 RAW_EXPORT_MARKER = ".autotakeout-export.json"
 RAW_DOWNLOADS_MARKER = ".autotakeout-downloads.json"
+MERGED_EXTRACTED_MARKER = ".autotakeout-extracted.json"
 RESTIC_RESTORE_MARKER = ".autotakeout-restore-marker.json"
 RESTIC_VALIDATION_MANIFEST = ".autotakeout-validation.json"
 VALIDATION_METADATA_NAMES = {
     RAW_EXPORT_MARKER,
     RAW_DOWNLOADS_MARKER,
+    MERGED_EXTRACTED_MARKER,
     RESTIC_RESTORE_MARKER,
     RESTIC_VALIDATION_MANIFEST,
 }
@@ -409,14 +411,47 @@ def is_takeout_report_archive(archive: Path) -> bool:
     except tarfile.TarError:
         return False
 
+def load_extracted_marker(merged: Path) -> dict:
+    try:
+        return json.loads((merged / MERGED_EXTRACTED_MARKER).read_text(encoding="utf-8"))
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return {"version": 1, "archives": {}}
+
+def archive_already_extracted(merged: Path, archive: Path) -> bool:
+    entry = load_extracted_marker(merged).get("archives", {}).get(archive.name)
+    if not entry:
+        return False
+    try:
+        return int(entry.get("size") or -1) == archive.stat().st_size
+    except OSError:
+        # Source archive is gone but we recorded extracting it: treat as done.
+        return True
+
+def record_extracted_archive(merged: Path, archive: Path, stats: dict) -> None:
+    try:
+        size = archive.stat().st_size
+    except OSError:
+        size = 0
+    data = load_extracted_marker(merged)
+    data.setdefault("archives", {})[archive.name] = {
+        "size": size,
+        "updated_at": time.strftime("%Y-%m-%dT%H:%M:%S%z"),
+        **{k: stats.get(k, 0) for k in ("reports", "moved", "duplicates", "collisions")},
+    }
+    write_private_json_if_changed(merged / MERGED_EXTRACTED_MARKER, data)
+
 def extract_archive(archive: Path, merged: Path) -> dict:
     manifest = merged / "autotakeout-merge-manifest.jsonl"
     stats = {"archives": 0, "reports": 0, "moved": 0, "duplicates": 0, "collisions": 0}
+    if archive_already_extracted(merged, archive):
+        print(f"already extracted {archive.name}; skipping")
+        return stats
     with manifest.open("a") as log:
         if is_takeout_report_archive(archive):
             print(f"keeping report archive without merging: {archive}")
             log.write(json.dumps({"report": str(archive)}) + "\n")
             stats["reports"] = 1
+            record_extracted_archive(merged, archive, stats)
             return stats
 
         temp = merged / ".extracting"
@@ -448,6 +483,7 @@ def extract_archive(archive: Path, merged: Path) -> dict:
         finally:
             shutil.rmtree(work, ignore_errors=True)
     stats["archives"] = 1
+    record_extracted_archive(merged, archive, stats)
     print(
         f"extracted {archive.name}; moved={stats['moved']} "
         f"duplicates={stats['duplicates']} collisions={stats['collisions']}"
