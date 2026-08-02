@@ -16,7 +16,7 @@
       ];
       forAllSystems = nixpkgs.lib.genAttrs systems;
       inputPaths =
-        builtins.concatStringsSep " "
+        builtins.concatStringsSep ":"
           (map (input: input.outPath) (builtins.attrValues (builtins.removeAttrs inputs [ "self" ])));
     in
     {
@@ -27,7 +27,7 @@
         in
         {
           default = pkgs.mkShell {
-            NIX_INPUTS = inputPaths;
+            FLAKE_INPUTS = inputPaths;
 
             packages =
               with pkgs;
